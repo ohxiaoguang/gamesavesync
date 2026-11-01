@@ -190,6 +190,19 @@ final class DecisionTests: XCTestCase {
         XCTAssertEqual(confirmation, .none)
     }
 
+    func testFirstUploadOfAGameWithNoRemoteCopyAsksForConfirmation() {
+        let local = snapshot(hash: "a", time: "2026-05-01T12:00:00.000Z")
+        let decision = SyncDecisionMaker.decide(local: local, remote: nil)
+        XCTAssertEqual(decision, .upload(.firstSyncLocalOnly))
+
+        let confirmation = SyncDecisionMaker.confirmation(for: decision,
+                                                          local: local,
+                                                          remote: nil,
+                                                          hasSyncedBefore: false)
+        XCTAssertEqual(confirmation, .firstUpload,
+                       "the very first upload of a game must be confirmed, never silent")
+    }
+
     func testClockSkewIsFlagged() {
         let local = snapshot(hash: "a", time: "2027-05-01T12:00:00.000Z")
         let remote = manifest(hash: "b", time: "2026-05-01T10:00:00.000Z")

@@ -12,8 +12,8 @@ struct RootView: View {
 
         NavigationStack(path: $path) {
             List {
-                if !model.cloudRootConfigured {
-                    cloudBanner
+                if !model.isDemoMode, !model.isRemoteConfigured || !model.hasStoredToken {
+                    gitHubBanner
                 }
 
                 if let operation = model.busy {
@@ -32,7 +32,7 @@ struct RootView: View {
                     } header: {
                         Text(model.l.t("Games"))
                     } footer: {
-                        Text(model.l.t("Everything runs on this device. Saves are copied to the iCloud Drive folder you picked."))
+                        Text(model.l.t("Save folders stay on this device. Each game's folder is uploaded to your private GitHub repository."))
                             .font(.footnote)
                     }
                 }
@@ -68,10 +68,6 @@ struct RootView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView()
         }
-        .sheet(isPresented: $model.showCloudSetup) {
-            CloudSetupView(isInitialSetup: true)
-                .interactiveDismissDisabled(model.games.isEmpty)
-        }
         .sheet(item: $model.conflict) { request in
             ConflictView(request: request)
         }
@@ -106,22 +102,22 @@ struct RootView: View {
                 set: { if !$0 { model.confirmation = nil } })
     }
 
-    private var cloudBanner: some View {
+    private var gitHubBanner: some View {
         Section {
             Button {
-                model.showCloudSetup = true
+                showSettings = true
             } label: {
                 HStack(spacing: 12) {
-                    Image(systemName: "icloud.and.arrow.up")
+                    Image(systemName: "arrow.triangle.branch")
                         .font(.title3)
                         .foregroundStyle(.white)
                         .frame(width: 38, height: 38)
                         .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(model.l.t("Configure iCloud Drive first"))
+                        Text(model.l.t("Connect your GitHub repository"))
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.primary)
-                        Text(model.l.t("Choose a folder inside iCloud Drive, for example iCloud Drive/GameSaveSync."))
+                        Text(model.l.t("Add the owner, repository name and an access token in Settings to sync between devices."))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.leading)

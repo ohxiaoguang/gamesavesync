@@ -131,8 +131,8 @@ public enum SyncPath {
     /// device that is usually a missing security scope or an unavailable file provider, and
     /// reporting it as "no subfolders" sent people looking for a problem that was not there.
     ///
-    /// The read goes through `NSFileCoordinator` because folders that live in a file provider
-    /// (iCloud Drive, another app's container) are only enumerated reliably as a coordinated read;
+    /// The read goes through `NSFileCoordinator` because folders served by a file provider — which
+    /// is what another app's container is — are only enumerated reliably as a coordinated read;
     /// without it the call can block until the provider decides to answer.
     public static func subdirectories(of directory: URL) throws -> [URL] {
         var coordinationError: NSError?

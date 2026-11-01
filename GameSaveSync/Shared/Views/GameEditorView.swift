@@ -41,7 +41,7 @@ struct GameEditorView: View {
                 }
                 if !isEditing {
                     Section {
-                        Text(model.l.t("If the cloud already has a backup for this ID, it will be linked automatically."))
+                        Text(model.l.t("If GitHub already has a backup for this ID, it will be linked automatically."))
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }

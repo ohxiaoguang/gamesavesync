@@ -4,7 +4,7 @@ import SwiftUI
 import UIKit
 
 /// Wraps `UIDocumentPickerViewController` in folder mode. The picker is the only supported way
-/// for an iOS app to reach a folder inside another app's Documents directory or iCloud Drive.
+/// for an iOS app to reach a folder inside another app's Documents directory or a file provider.
 struct FolderPickerSheet: UIViewControllerRepresentable {
     var directoryURL: URL? = nil
     var onPick: (URL) -> Void

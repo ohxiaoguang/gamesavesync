@@ -4,19 +4,27 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
 
+    @State private var owner = ""
+    @State private var repositoryName = ""
+    @State private var branch = GitHubRepository.fallbackBranch
+    @State private var tokenDraft = ""
+    @State private var tokenMessage: String?
+    @State private var commitTask: Task<Void, Never>?
+    @State private var didLoad = false
+
     var body: some View {
         NavigationStack {
             Form {
-                cloudSection
+                gitHubSection
+                tokenSection
+                connectionSection
                 historySection
                 languageSection
                 deviceSection
                 aboutSection
             }
             #if os(macOS)
-            .frame(width: 540)
-            #endif
-            #if os(macOS)
+            .frame(width: 560)
             .formStyle(.grouped)
             #endif
             .navigationTitle(model.l.t("Settings"))
@@ -25,54 +33,182 @@ struct SettingsView: View {
             #endif
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(model.l.t("Done")) { dismiss() }
+                    Button(model.l.t("Done")) {
+                        commitRepository()
+                        dismiss()
+                    }
                 }
             }
-            .cloudRootWarningAlert()
+            .onAppear(perform: load)
+            .onDisappear { commitTask?.cancel() }
         }
         #if os(macOS)
-        .frame(width: 540)
+        .frame(width: 560)
         #endif
     }
 
-    private var cloudSection: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Image(systemName: model.cloudRootConfigured ? "icloud.fill" : "icloud.slash")
-                        .foregroundStyle(model.cloudRootConfigured ? Color.accentColor : .secondary)
-                    Text(model.cloudRootDescription())
-                        .font(.subheadline)
-                        .textSelection(.enabled)
-                }
-                if model.cloudRootConfigured {
-                    Text(model.settings.cloudRootIsICloud
-                         ? "iCloud Drive"
-                         : model.l.t("On this device only — not synced"))
-                        .font(.caption)
-                        .foregroundStyle(model.settings.cloudRootIsICloud ? Color.secondary : Color.orange)
-                }
-            }
+    // MARK: - GitHub
 
-            FolderPickerButton(title: model.cloudRootConfigured ? model.l.t("Change Folder") : model.l.t("Choose Folder…")) { url in
-                model.setCloudRoot(url)
+    private var gitHubSection: some View {
+        Section {
+            LabeledContent(model.l.t("Repository Owner")) {
+                TextField("ohxiaoguang", text: $owner)
+                    .multilineTextAlignment(.trailing)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .onChange(of: owner) { _, _ in scheduleCommit() }
+            }
+            LabeledContent(model.l.t("Repository Name")) {
+                TextField(model.l.t("private save repository"), text: $repositoryName)
+                    .multilineTextAlignment(.trailing)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .onChange(of: repositoryName) { _, _ in scheduleCommit() }
+            }
+            LabeledContent(model.l.t("Branch")) {
+                TextField(GitHubRepository.fallbackBranch, text: $branch)
+                    .multilineTextAlignment(.trailing)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .onChange(of: branch) { _, _ in scheduleCommit() }
             }
         } header: {
-            Text(model.l.t("iCloud Drive Folder"))
+            Text(model.l.t("GitHub Repository"))
         } footer: {
-            Text(model.l.t("The folder where all game backups are stored."))
+            Text(model.l.t("Use a private repository you created for game saves. GameSaveSync writes only to games/<game id>/ and never changes repository settings."))
         }
     }
 
+    private var tokenSection: some View {
+        Section {
+            SecureField(model.hasStoredToken ? model.l.t("Token saved — enter a new one to replace it") : "github_pat_…",
+                        text: $tokenDraft)
+                .autocorrectionDisabled()
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+
+            HStack(spacing: 12) {
+                Button(model.l.t("Save Token")) {
+                    tokenMessage = model.saveToken(tokenDraft)
+                    if tokenMessage == nil {
+                        tokenDraft = ""
+                        model.showToast(.init(text: model.l.t("Token saved in the Keychain"), symbol: "key.fill"))
+                    }
+                }
+                .disabled(tokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                if model.hasStoredToken {
+                    Button(model.l.t("Remove Token"), role: .destructive) {
+                        model.deleteToken()
+                        tokenDraft = ""
+                        tokenMessage = nil
+                    }
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 6) {
+                Image(systemName: model.hasStoredToken ? "checkmark.seal.fill" : "key.slash")
+                    .foregroundStyle(model.hasStoredToken ? Color.green : .secondary)
+                Text(model.hasStoredToken ? model.l.t("Token stored in the Keychain") : model.l.t("No token stored"))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let tokenMessage {
+                Text(tokenMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+        } header: {
+            Text(model.l.t("Access Token"))
+        } footer: {
+            Text(model.l.t("Fine-grained token with Contents: Read and write on this repository. It is stored in the Keychain, never in settings.json or the logs."))
+        }
+    }
+
+    private var connectionSection: some View {
+        Section {
+            Button {
+                commitRepository()
+                Task { await model.testConnection() }
+            } label: {
+                HStack(spacing: 8) {
+                    if model.isTestingConnection {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(model.isTestingConnection ? model.l.t("Testing…") : model.l.t("Test Connection"))
+                }
+            }
+            .disabled(model.isTestingConnection || !model.isRemoteConfigured || !model.hasStoredToken)
+
+            if let report = model.connection {
+                connectionRow(label: model.l.t("Status"),
+                              value: model.l.t("Connected"),
+                              tint: .green)
+                connectionRow(label: model.l.t("Permissions"),
+                              value: permissionText(report),
+                              tint: report.canWrite ? .green : .orange)
+                connectionRow(label: model.l.t("Repository"),
+                              value: report.isPrivate ? model.l.t("Private") : model.l.t("Public"),
+                              tint: report.isPrivate ? .green : .red)
+                connectionRow(label: model.l.t("Branch"),
+                              value: report.isEmptyRepository
+                                  ? "\(report.defaultBranch) · \(model.l.t("empty (set up on first upload)"))"
+                                  : model.l.t("readable"),
+                              tint: .secondary)
+            } else if let error = model.connectionError {
+                connectionRow(label: model.l.t("Status"),
+                              value: model.l.t("Not connected"),
+                              tint: .red)
+                Text(error)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } header: {
+            Text(model.l.t("Connection"))
+        } footer: {
+            Text(model.l.t("The test checks that the repository exists, belongs to the owner, is private, and that the token may read and write the branch."))
+        }
+    }
+
+    private func permissionText(_ report: GitHubConnectionReport) -> String {
+        if report.canWrite { return model.l.t("Read and write") }
+        if report.canRead { return model.l.t("Read only") }
+        return model.l.t("No access")
+    }
+
+    private func connectionRow(label: String, value: String, tint: Color) -> some View {
+        HStack {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(value)
+                .foregroundStyle(tint)
+                .multilineTextAlignment(.trailing)
+        }
+        .font(.callout)
+    }
+
+    // MARK: - Other sections
+
     private var historySection: some View {
         Section {
-            Stepper(value: Binding(get: { model.settings.historyRetention },
-                                   set: { value in model.updateSettings { $0.historyRetention = max(1, min(value, 20)) } }),
+            Stepper(value: Binding(get: { model.settings.localBackupRetention },
+                                   set: { value in model.updateSettings { $0.localBackupRetention = max(1, min(value, 20)) } }),
                     in: 1...10) {
-                Text("\(model.l.t("History Versions"))  \(model.settings.historyRetention)")
+                Text("\(model.l.t("Local Backups"))  \(model.settings.localBackupRetention)")
             }
         } footer: {
-            Text(model.l.f("Keep last %d versions", model.settings.historyRetention))
+            Text(model.l.t("How many safety copies of a save folder are kept on this device. GitHub keeps every uploaded version in its own commit."))
         }
     }
 
@@ -98,125 +234,45 @@ struct SettingsView: View {
                       text: Binding(get: { model.settings.deviceName },
                                     set: { value in model.updateSettings { $0.deviceName = value } }))
         } footer: {
-            Text(model.l.t("Used in backup manifests to show where a backup came from."))
+            Text(model.l.t("Recorded in each manifest so you can see which device uploaded a version."))
         }
     }
 
     private var aboutSection: some View {
         Section {
             LabeledContent(model.l.t("Version"), value: AppModel.appVersion)
-            Text(model.l.t("GameSaveSync keeps a complete copy of each game's save folder in iCloud Drive. Everything runs on device: no account, no server, no background sync."))
+            Text(model.l.t("GameSaveSync archives each game's save folder and keeps it in your private GitHub repository. Saves are read only on this device and only when you start a sync."))
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         } header: {
             Text(model.l.t("About GameSaveSync"))
         }
     }
-}
 
-struct CloudSetupView: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
+    // MARK: - Editing
 
-    var isInitialSetup = false
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    HStack(spacing: 14) {
-                        Image(systemName: "icloud.and.arrow.up")
-                            .font(.system(size: 26))
-                            .foregroundStyle(.white)
-                            .frame(width: 54, height: 54)
-                            .background(LinearGradient(colors: [Color.accentColor, Color.accentColor.opacity(0.7)],
-                                                       startPoint: .topLeading,
-                                                       endPoint: .bottomTrailing),
-                                        in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(model.l.t("iCloud Drive Folder"))
-                                .font(.title3.weight(.semibold))
-                            Text(model.cloudRootConfigured ? model.l.t("Configured") : model.l.t("Not configured"))
-                                .font(.caption)
-                                .foregroundStyle(model.cloudRootConfigured ? Color.green : .secondary)
-                        }
-                    }
-
-                    if model.cloudRootConfigured {
-                        Text(model.l.t("Backups are written into this folder. Choose a different one at any time."))
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        Text(model.l.t("iCloud Drive is not set up yet. Choose a folder inside iCloud Drive, for example iCloud Drive/GameSaveSync."))
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        bullet("1", model.l.t("Open the Files app and go to iCloud Drive."))
-                        bullet("2", model.l.t("Create a folder named GameSaveSync (or pick any folder you like)."))
-                        bullet("3", model.l.t("Come back here and select that folder."))
-                    }
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-                    if model.cloudRootConfigured {
-                        Text(model.cloudRootDescription())
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
-
-                    FolderPickerButton(title: model.cloudRootConfigured ? model.l.t("Change Folder") : model.l.t("Choose Folder…")) { url in
-                        model.setCloudRoot(url)
-                        if isInitialSetup, model.cloudRootConfigured {
-                            dismiss()
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-
-                    Text(model.l.t("Everything runs on this device. Saves are copied to the iCloud Drive folder you picked."))
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(22)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .navigationTitle(model.l.t("iCloud Drive Folder"))
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(model.l.t("Cancel")) { dismiss() }
-                }
-            }
-            .cloudRootWarningAlert {
-                if isInitialSetup, model.cloudRootConfigured { dismiss() }
-            }
-        }
-        #if os(macOS)
-        .frame(width: 520, height: 520)
-        #endif
+    private func load() {
+        guard !didLoad else { return }
+        didLoad = true
+        owner = model.settings.gitHubOwner
+        repositoryName = model.settings.gitHubName
+        branch = model.settings.gitHubBranch
     }
 
-    private func bullet(_ index: String, _ text: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Text(index)
-                .font(.caption.weight(.bold))
-                .foregroundStyle(.white)
-                .frame(width: 18, height: 18)
-                .background(Circle().fill(Color.accentColor))
-            Text(text)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+    /// Small debounce so typing a repository name does not trigger a sync per keystroke.
+    private func scheduleCommit() {
+        commitTask?.cancel()
+        commitTask = Task {
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { commitRepository() }
         }
+    }
+
+    private func commitRepository() {
+        let current = GitHubRepository(owner: owner, name: repositoryName, branch: branch)
+        guard current != model.repository else { return }
+        model.updateRepository(owner: owner, name: repositoryName, branch: branch)
     }
 }
 
@@ -241,7 +297,7 @@ struct ConflictView: View {
                             files: request.analysis.local?.fileCount ?? 0,
                             bytes: request.analysis.local?.totalBytes ?? 0)
                     Divider()
-                    sideRow(title: model.l.t("Cloud version"),
+                    sideRow(title: model.l.t("Remote version"),
                             date: DateText.stamp(request.analysis.remote?.saveModifiedAt, language: model.l.language),
                             files: request.analysis.remote?.fileCount ?? 0,
                             bytes: request.analysis.remote?.totalBytes ?? 0)
@@ -265,7 +321,7 @@ struct ConflictView: View {
                     Button {
                         model.resolveConflict(useLocal: false, request: request)
                     } label: {
-                        Label(model.l.t("Use Cloud Version"), systemImage: "arrow.down.circle.fill")
+                        Label(model.l.t("Use Remote Version"), systemImage: "arrow.down.circle.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -302,34 +358,5 @@ struct ConflictView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-    }
-}
-
-/// Warns when the chosen sync folder is not inside iCloud Drive. Such a folder still works,
-/// but nothing leaves the device, so the choice must be explicit.
-private struct CloudRootWarningAlert: ViewModifier {
-    @Environment(AppModel.self) private var model
-    var onAccepted: (() -> Void)?
-
-    func body(content: Content) -> some View {
-        content.alert(model.l.t("This folder is not in iCloud Drive"),
-                      isPresented: Binding(get: { model.pendingCloudRoot != nil },
-                                           set: { if !$0 { model.cancelPendingCloudRoot() } })) {
-            Button(model.l.t("Use Anyway"), role: .destructive) {
-                model.usePendingCloudRootAnyway()
-                onAccepted?()
-            }
-            Button(model.l.t("Choose Again"), role: .cancel) {
-                model.cancelPendingCloudRoot()
-            }
-        } message: {
-            Text(model.l.t("Backups stay on this device and will not appear on your other devices. Choose a folder inside iCloud Drive to sync between iPhone, iPad and Mac."))
-        }
-    }
-}
-
-extension View {
-    func cloudRootWarningAlert(onAccepted: (() -> Void)? = nil) -> some View {
-        modifier(CloudRootWarningAlert(onAccepted: onAccepted))
     }
 }

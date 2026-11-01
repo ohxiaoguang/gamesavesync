@@ -38,7 +38,7 @@ struct GameDetailView: View {
         .task {
             if let game {
                 await model.refresh(game)
-                model.loadHistory(for: game)
+                await model.loadHistory(for: game)
                 model.loadLocalBackups(for: game)
                 model.loadLeftovers(for: game)
             }
@@ -81,11 +81,17 @@ struct GameDetailView: View {
             }
 
             InfoRow(label: model.l.t("Local"), value: DateText.stamp(analysis?.local?.newestModified, language: model.l.language))
-            InfoRow(label: model.l.t("Cloud"), value: DateText.stamp(analysis?.remote?.saveModifiedAt, language: model.l.language))
+            InfoRow(label: model.l.t("Remote"), value: DateText.stamp(analysis?.remote?.saveModifiedAt, language: model.l.language))
 
             if let local = analysis?.local, local.fileCount > 0 {
                 InfoRow(label: model.l.t("Files"),
                         value: "\(model.l.files(local.fileCount)) · \(ByteText.string(local.totalBytes))")
+                if GitHubLimits.needsWarning(Int(clamping: local.totalBytes)) {
+                    Text(model.l.f("This save is larger than 50 MiB (%@). Uploading takes longer and the GitHub repository grows with every version.",
+                                   ByteText.string(local.totalBytes)))
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
 
             if let lastSync = game.lastSync {
@@ -167,7 +173,7 @@ struct GameDetailView: View {
                     .foregroundStyle(.secondary)
             }
         } header: {
-            Text(model.l.t("Cloud"))
+            Text(model.l.t("Remote"))
         }
     }
 
@@ -211,7 +217,7 @@ struct GameDetailView: View {
 
     @ViewBuilder
     private func historySection(_ game: Game) -> some View {
-        let entries = model.cloudHistory[game.id] ?? []
+        let entries = model.remoteHistory[game.id] ?? []
         Section {
             if entries.isEmpty {
                 Text(model.l.t("No history yet"))
@@ -226,6 +232,9 @@ struct GameDetailView: View {
                             Text("\(DateText.stamp(entry.saveModifiedAt, language: model.l.language)) · \(model.l.files(entry.fileCount)) · \(entry.sourceDevice)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
+                            Text(String(entry.commitSHA.prefix(7)))
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.tertiary)
                         }
                         Spacer()
                         Button(model.l.t("Restore")) {
@@ -236,9 +245,16 @@ struct GameDetailView: View {
                         .disabled(model.isBusyAtAll)
                     }
                 }
+                if model.hasMoreHistory(for: game) {
+                    Button(model.l.t("Load more")) {
+                        Task { await model.loadMoreHistory(for: game) }
+                    }
+                    .controlSize(.small)
+                    .disabled(model.isBusyAtAll)
+                }
             }
         } header: {
-            Text(model.l.t("Cloud History"))
+            Text(model.l.t("Version History"))
         }
     }
 
@@ -289,7 +305,6 @@ struct GameDetailView: View {
     private func kindText(_ kind: SyncRecord.Kind) -> String {
         switch kind {
         case .uploaded: return model.l.t("Uploaded")
-        case .uploadedPendingICloud: return model.l.t("Uploaded (waiting for iCloud)")
         case .restored: return model.l.t("Restored")
         case .restoredHistory: return model.l.t("Restored from history")
         case .upToDate: return model.l.t("Already up to date")

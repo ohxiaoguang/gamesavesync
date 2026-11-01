@@ -64,7 +64,7 @@ final class SyncFlowTests: XCTestCase {
         add(attachment)
     }
 
-    func testSyncRestoresNewerCloudVersion() {
+    func testSyncRestoresNewerRemoteVersion() {
         let app = XCUIApplication()
         app.launchArguments = ["-GSSDemoSeed", "-AppleLanguages", "(en)"]
         app.launch()
@@ -107,8 +107,39 @@ final class ConfirmationFlowTests: XCTestCase {
         alert.buttons["Restore"].tap()
 
         XCTAssertTrue(app.staticTexts["Restored"].waitForExistence(timeout: 90),
-                      "confirming must restore the cloud version, not upload the local one")
+                      "confirming must restore the remote version, not upload the local one")
         XCTAssertTrue(app.staticTexts["Up to date"].waitForExistence(timeout: 20))
+    }
+}
+
+final class HistoryFlowTests: XCTestCase {
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+    }
+
+    func testRemoteHistoryListsCommits() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-GSSDemoSeed", "-AppleLanguages", "(en)"]
+        app.launch()
+
+        XCTAssertTrue(app.staticTexts["Mario Wonder"].waitForExistence(timeout: 20))
+        app.staticTexts["Mario Wonder"].tap()
+
+        // The history lives below the actions, so scroll until the section is on screen.
+        let header = app.staticTexts["Version History"]
+        var swipes = 0
+        while !header.exists, swipes < 8 {
+            app.swipeUp()
+            swipes += 1
+        }
+        XCTAssertTrue(header.exists, "the detail page must show the remote commit history")
+        XCTAssertFalse(app.staticTexts["No history yet"].exists,
+                       "a game that was uploaded has at least one commit")
+
+        let shot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        shot.name = "11-history"
+        shot.lifetime = .keepAlways
+        add(shot)
     }
 }
 
@@ -117,7 +148,7 @@ final class SettingsScreenTests: XCTestCase {
         continueAfterFailure = false
     }
 
-    func testSettingsShowsWhereBackupsAreStored() {
+    func testSettingsConfiguresTheGitHubRepository() {
         let app = XCUIApplication()
         app.launchArguments = ["-GSSDemoSeed", "-AppleLanguages", "(en)"]
         app.launch()
@@ -126,8 +157,14 @@ final class SettingsScreenTests: XCTestCase {
         app.buttons["Settings"].firstMatch.tap()
 
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["On this device only — not synced"].exists,
-                      "a folder outside iCloud Drive must be labelled as not synced")
+        XCTAssertTrue(app.staticTexts["GitHub Repository"].exists,
+                      "the settings screen must configure the remote repository")
+        XCTAssertTrue(app.staticTexts["Repository Owner"].exists)
+        XCTAssertTrue(app.staticTexts["Access Token"].exists)
+        XCTAssertTrue(app.staticTexts["No token stored"].exists)
+        XCTAssertFalse(app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS[c] %@", "iCloud")
+        ).firstMatch.exists, "no iCloud wording may remain in settings")
 
         let shot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         shot.name = "08-settings"

@@ -24,7 +24,7 @@ Package.resolved
 *~
 .DS_Store?
 
-# 本地存档 / iCloud 同步测试数据
+# 本地存档 / 同步测试数据
 *.save
 Backups/
 TestResults/

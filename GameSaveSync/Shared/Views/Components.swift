@@ -41,15 +41,75 @@ extension SyncAnalysis {
                                           tint: .orange,
                                           detail: error.localized(localizer))
             }
-            if case .cloudRootUnavailable = error {
-                return StatusPresentation(text: localizer.t("Configure iCloud Drive first"),
-                                          symbol: "icloud.slash",
+            if case .gitHubNotConfigured = error {
+                return StatusPresentation(text: localizer.t("Connect a GitHub repository"),
+                                          symbol: "arrow.triangle.branch",
                                           tint: .orange,
                                           detail: error.localized(localizer))
             }
             if case .cloudBackupIncomplete = error {
-                return StatusPresentation(text: localizer.t("Cloud backup incomplete"),
+                return StatusPresentation(text: localizer.t("Remote save incomplete"),
                                           symbol: "exclamationmark.arrow.triangle.2.circlepath",
+                                          tint: .orange,
+                                          detail: error.localized(localizer))
+            }
+            if case .cloudBackupMissing = error {
+                return StatusPresentation(text: localizer.t("No remote save yet"),
+                                          symbol: "arrow.triangle.branch",
+                                          tint: .secondary,
+                                          detail: nil)
+            }
+            if case .gitHubAuthFailed = error {
+                return StatusPresentation(text: localizer.t("Token rejected"),
+                                          symbol: "key.slash",
+                                          tint: .red,
+                                          detail: error.localized(localizer))
+            }
+            if case .gitHubPermissionDenied = error {
+                return StatusPresentation(text: localizer.t("Missing permission"),
+                                          symbol: "lock.slash",
+                                          tint: .red,
+                                          detail: error.localized(localizer))
+            }
+            if case .gitHubRateLimited = error {
+                return StatusPresentation(text: localizer.t("Rate limited"),
+                                          symbol: "hourglass",
+                                          tint: .orange,
+                                          detail: error.localized(localizer))
+            }
+            if case .gitHubRepositoryNotFound = error {
+                return StatusPresentation(text: localizer.t("Repository not found"),
+                                          symbol: "questionmark.folder",
+                                          tint: .red,
+                                          detail: error.localized(localizer))
+            }
+            if case .gitHubRepositoryNotPrivate = error {
+                return StatusPresentation(text: localizer.t("Repository is not private"),
+                                          symbol: "lock.open",
+                                          tint: .red,
+                                          detail: error.localized(localizer))
+            }
+            if case .gitHubBranchMissing = error {
+                return StatusPresentation(text: localizer.t("Branch not found"),
+                                          symbol: "arrow.triangle.branch",
+                                          tint: .red,
+                                          detail: error.localized(localizer))
+            }
+            if case .gitHubRemoteChanged = error {
+                return StatusPresentation(text: localizer.t("Remote version changed"),
+                                          symbol: "arrow.triangle.2.circlepath",
+                                          tint: .orange,
+                                          detail: error.localized(localizer))
+            }
+            if case .networkUnavailable = error {
+                return StatusPresentation(text: localizer.t("Offline"),
+                                          symbol: "wifi.slash",
+                                          tint: .orange,
+                                          detail: error.localized(localizer))
+            }
+            if case .networkTimeout = error {
+                return StatusPresentation(text: localizer.t("Connection timed out"),
+                                          symbol: "clock.badge.exclamationmark",
                                           tint: .orange,
                                           detail: error.localized(localizer))
             }
@@ -65,7 +125,7 @@ extension SyncAnalysis {
                 return StatusPresentation(text: localizer.t("Save folder missing"),
                                           symbol: "folder.badge.questionmark",
                                           tint: .orange,
-                                          detail: localizer.t("Syncing will create it inside the authorised folder and restore the cloud backup."))
+                                          detail: localizer.t("Syncing will create it inside the authorised folder and restore the remote backup."))
             case .accessRootMissing:
                 return StatusPresentation(text: localizer.t("Authorised folder missing"),
                                           symbol: "folder.badge.minus",
@@ -98,8 +158,8 @@ extension SyncAnalysis {
                                       detail: localizer.t("Both versions have the same timestamp but different content."))
         case .upToDate:
             if remote == nil && local?.isEmpty == true {
-                return StatusPresentation(text: localizer.t("Cloud backup missing"),
-                                          symbol: "icloud.slash",
+                return StatusPresentation(text: localizer.t("No remote save yet"),
+                                          symbol: "arrow.triangle.branch",
                                           tint: .secondary,
                                           detail: nil)
             }
@@ -118,7 +178,7 @@ extension SyncAnalysis {
                 return StatusPresentation(text: localizer.t("Local is newer"),
                                           symbol: "arrow.up.circle.fill",
                                           tint: .blue,
-                                          detail: localizer.t("The cloud backup is empty. Uploading will replace it with your local saves."))
+                                          detail: localizer.t("The remote backup is empty. Uploading will replace it with your local saves."))
             default:
                 return StatusPresentation(text: localizer.t("Local is newer"),
                                           symbol: "arrow.up.circle.fill",
@@ -128,17 +188,17 @@ extension SyncAnalysis {
         case .download(let reason):
             switch reason {
             case .firstSyncCloudOnly:
-                return StatusPresentation(text: localizer.t("Only in the cloud"),
-                                          symbol: "icloud.and.arrow.down",
+                return StatusPresentation(text: localizer.t("Only on GitHub"),
+                                          symbol: "arrow.down.circle",
                                           tint: .indigo,
                                           detail: nil)
             case .localEmpty:
-                return StatusPresentation(text: localizer.t("Cloud is newer"),
+                return StatusPresentation(text: localizer.t("Remote is newer"),
                                           symbol: "arrow.down.circle.fill",
                                           tint: .indigo,
-                                          detail: localizer.t("The local folder is empty. Restoring will fill it with the cloud backup."))
+                                          detail: localizer.t("The local folder is empty. Restoring will fill it with the remote backup."))
             default:
-                return StatusPresentation(text: localizer.t("Cloud is newer"),
+                return StatusPresentation(text: localizer.t("Remote is newer"),
                                           symbol: "arrow.down.circle.fill",
                                           tint: .indigo,
                                           detail: nil)
@@ -218,7 +278,7 @@ struct EmptyGamesView: View {
                 .foregroundStyle(.secondary)
             Text(localizer.t("Add Game"))
                 .font(.headline)
-            Text(localizer.t("Add a game, pick its save folder on this device, and keep a full copy in iCloud Drive."))
+            Text(localizer.t("Add a game, pick its save folder on this device, and keep a full copy in your private GitHub repository."))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

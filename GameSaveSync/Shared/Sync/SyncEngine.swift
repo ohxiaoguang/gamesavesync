@@ -57,7 +57,11 @@ public enum SyncDecisionMaker {
             return .none
         case .upload(let reason):
             switch reason {
-            case .firstSyncLocalOnly, .cloudEmpty:
+            case .firstSyncLocalOnly:
+                // The first version of a game is worth confirming: it is the only upload that has
+                // no previous remote copy to compare against.
+                return .firstUpload
+            case .cloudEmpty:
                 return .none
             case .localNewer:
                 if !hasSyncedBefore, (remote?.fileCount ?? 0) > 0 { return .firstSyncOverwrite(.upload) }
@@ -95,10 +99,12 @@ public struct SyncRequest: Sendable {
     public var accessRoot: URL?
     /// Path of `localDirectory` relative to `accessRoot`. Empty when they are the same folder.
     public var syncRelativePath: String
-    public var cloudRoot: URL
-    public var retention: Int
+    public var remote: any RemoteStore
+    /// How many local safety copies to keep.
+    public var localBackupRetention: Int
     public var deviceName: String
     public var appVersion: String
+    /// True only when the last successful sync was with this same remote.
     public var hasSyncedBefore: Bool
     public var progress: (@Sendable (SyncPhase) -> Void)?
 
@@ -107,8 +113,8 @@ public struct SyncRequest: Sendable {
                 localDirectory: URL,
                 accessRoot: URL? = nil,
                 syncRelativePath: String = "",
-                cloudRoot: URL,
-                retention: Int = 3,
+                remote: any RemoteStore,
+                localBackupRetention: Int = 3,
                 deviceName: String = "Device",
                 appVersion: String = "1.0",
                 hasSyncedBefore: Bool = false,
@@ -118,8 +124,8 @@ public struct SyncRequest: Sendable {
         self.localDirectory = localDirectory
         self.accessRoot = accessRoot
         self.syncRelativePath = syncRelativePath
-        self.cloudRoot = cloudRoot
-        self.retention = retention
+        self.remote = remote
+        self.localBackupRetention = localBackupRetention
         self.deviceName = deviceName
         self.appVersion = appVersion
         self.hasSyncedBefore = hasSyncedBefore
@@ -153,17 +159,31 @@ public struct SyncEngine: Sendable {
         try? paths.ensureDirectories()
     }
 
-    private var scanner: SaveScanner {
-        SaveScanner(prepare: { url in
-            try ICloudSupport.ensureDownloaded(url)
-        })
-    }
+    private var scanner: SaveScanner { SaveScanner() }
 
     // MARK: - Analysis
 
     /// Full analysis: the local folder is scanned and hashed so identical content is detected
-    /// even when timestamps happen to match.
-    public func analyze(_ request: SyncRequest) -> SyncAnalysis {
+    /// even when timestamps happen to match, and the remote manifest is read at a fixed commit.
+    public func analyze(_ request: SyncRequest) async -> SyncAnalysis {
+        request.report(.connecting)
+        var remoteCommit: String?
+        var remoteManifest: CloudManifest?
+        var remoteError: SyncError?
+
+        do {
+            let head = try await request.remote.head()
+            remoteCommit = head.commit
+            if let commit = head.commit {
+                request.report(.readingRemote)
+                remoteManifest = try await request.remote.manifest(gameId: request.gameId, commit: commit)
+            }
+        } catch let error as SyncError {
+            remoteError = error
+        } catch {
+            remoteError = .networkUnavailable
+        }
+
         var local: SaveSnapshot?
         var localError: SyncError?
         var localEmpty = false
@@ -172,6 +192,7 @@ public struct SyncEngine: Sendable {
             localError = request.localAvailabilityError
         } else {
             do {
+                request.report(.scanning)
                 let result = try scanner.scan(directory: request.localDirectory, computeHash: true)
                 local = result.snapshot
                 localEmpty = result.snapshot.isEmpty
@@ -182,44 +203,40 @@ public struct SyncEngine: Sendable {
             }
         }
 
-        let cloud = CloudStorageManager(root: request.cloudRoot)
-        let state = cloud.loadManifestState(gameId: request.gameId)
-        let historyCount = cloud.historyEntries(gameId: request.gameId).count
-
         let decision: SyncDecision
-        if let remoteError = state.error {
+        if let remoteError {
             decision = .blocked(remoteError)
         } else if let localError, local == nil {
-            // A missing sync folder is not a lost authorisation: if the cloud has a backup the
+            // A missing sync folder is not a lost authorisation: if the remote has a backup the
             // folder is simply created and filled, which is exactly what a fresh install needs.
-            if case .syncFolderMissing = localError, state.manifest != nil {
+            if case .syncFolderMissing = localError, remoteManifest != nil {
                 decision = .download(.localEmpty)
             } else {
                 decision = .blocked(localError)
             }
         } else {
-            decision = SyncDecisionMaker.decide(local: local, remote: state.manifest)
+            decision = SyncDecisionMaker.decide(local: local, remote: remoteManifest)
         }
 
         let confirmation = SyncDecisionMaker.confirmation(for: decision,
                                                           local: local,
-                                                          remote: state.manifest,
+                                                          remote: remoteManifest,
                                                           hasSyncedBefore: request.hasSyncedBefore)
 
         return SyncAnalysis(local: local,
                             localError: localError,
                             localFolderEmpty: localEmpty,
-                            remote: state.manifest,
-                            remoteError: state.error,
-                            historyCount: historyCount,
+                            remote: remoteManifest,
+                            remoteError: remoteError,
+                            remoteCommit: remoteCommit,
                             decision: decision,
                             confirmation: confirmation,
                             localFolderURL: request.localDirectory,
                             localReadable: local != nil)
     }
 
-    public func history(_ request: SyncRequest) -> [CloudHistoryEntry] {
-        CloudStorageManager(root: request.cloudRoot).historyEntries(gameId: request.gameId)
+    public func history(_ request: SyncRequest, limit: Int = 10, page: Int = 1) async throws -> [CloudHistoryEntry] {
+        try await request.remote.history(gameId: request.gameId, limit: limit, page: page)
     }
 
     public func localBackups(gameId: String) -> [LocalBackup] {
@@ -232,9 +249,13 @@ public struct SyncEngine: Sendable {
 
     // MARK: - Sync
 
-    /// Runs the decision produced by `analyze`.
-    public func sync(_ request: SyncRequest) throws -> SyncReport {
-        let analysis = analyze(request)
+    /// Analyse, then follow the decision once.
+    ///
+    /// A remote change detected between the analysis and the write is surfaced as
+    /// `.gitHubRemoteChanged` instead of being retried: the caller re-analyses and asks again, so
+    /// no version is ever replaced without the user having seen the comparison it replaced.
+    public func sync(_ request: SyncRequest) async throws -> SyncReport {
+        let analysis = await analyze(request)
         switch analysis.decision {
         case .blocked(let error):
             throw error
@@ -244,22 +265,39 @@ public struct SyncEngine: Sendable {
             let snapshot = analysis.local ?? .empty
             return SyncReport(outcome: .upToDate, files: snapshot.fileCount, bytes: snapshot.totalBytes)
         case .upload:
-            return try upload(request)
+            return try await upload(request, basedOn: analysis)
         case .download:
-            return try restore(request)
+            return try await restore(request, from: analysis)
         }
     }
 
-    public func perform(_ request: SyncRequest, direction: SyncDirection) throws -> SyncReport {
+    /// Runs a direction the user picked explicitly. The remote is re-read first so the operation
+    /// never acts on a comparison made a while ago.
+    ///
+    /// A remote change detected after that read is **not** retried here: an explicit upload or
+    /// restore must never quietly write over a version the user has not seen. The error is passed
+    /// to the caller so it can show the new comparison instead.
+    public func perform(_ request: SyncRequest, direction: SyncDirection) async throws -> SyncReport {
+        let analysis = await analyze(request)
+        if case .blocked(let error) = analysis.decision, analysis.remoteError != nil {
+            throw error
+        }
         switch direction {
-        case .upload: return try upload(request)
-        case .download: return try restore(request)
+        case .upload: return try await upload(request, basedOn: analysis)
+        case .download: return try await restore(request, from: analysis)
         }
     }
 
     // MARK: - Upload
 
-    public func upload(_ request: SyncRequest) throws -> SyncReport {
+    /// Convenience for callers that hold only a request: compares first, then uploads.
+    public func upload(_ request: SyncRequest) async throws -> SyncReport {
+        let analysis = await analyze(request)
+        if case .blocked(let error) = analysis.decision { throw error }
+        return try await upload(request, basedOn: analysis)
+    }
+
+    public func upload(_ request: SyncRequest, basedOn analysis: SyncAnalysis) async throws -> SyncReport {
         request.report(.scanning)
         guard FileSystem.isDirectory(request.localDirectory) else {
             throw request.localAvailabilityError
@@ -272,7 +310,7 @@ public struct SyncEngine: Sendable {
 
         let work = try paths.makeWorkDirectory(name: "upload")
         defer { try? FileManager.default.removeItem(at: work) }
-        let archiveURL = work.appendingPathComponent("latest.zip")
+        let archiveURL = work.appendingPathComponent(GitHubLayout.archiveFileName)
 
         request.report(.packaging)
         let metadata = try ArchiveManager.createArchive(from: scan,
@@ -294,6 +332,10 @@ public struct SyncEngine: Sendable {
         guard archiveBytes > 0 else {
             throw SyncError.archiveCorrupt("The archive is empty.")
         }
+        // Fail before touching the network, with an explanation rather than a crash.
+        guard !GitHubLimits.isTooLarge(archiveBytes) else {
+            throw SyncError.gitHubFileTooLarge(bytes: archiveBytes, limit: GitHubLimits.maximumBytes)
+        }
 
         let versionId = Self.makeVersionId()
         let manifest = CloudManifest(gameId: request.gameId,
@@ -307,68 +349,82 @@ public struct SyncEngine: Sendable {
                                      contentHash: scan.snapshot.contentHash,
                                      fileCount: scan.snapshot.fileCount,
                                      totalBytes: scan.snapshot.totalBytes,
-                                     archiveFileName: "latest.zip",
+                                     archiveFileName: GitHubLayout.archiveFileName,
                                      archiveBytes: archiveBytes,
                                      archiveSHA256: try Hashing.sha256Hex(fileAt: archiveURL),
                                      status: .complete)
 
-        request.report(.writingCloud)
-        let cloud = CloudStorageManager(root: request.cloudRoot)
-        let published = try cloud.publish(manifest: manifest,
-                                          archive: archiveURL,
-                                          retention: request.retention)
+        let precondition = UploadPrecondition(baseCommit: analysis.remoteCommit,
+                                              remoteContentHash: analysis.remote?.contentHash)
 
-        let pending: Bool
-        switch published.uploadState {
-        case .pending:
-            pending = true
-        case .uploaded, .notICloud, .unknown:
-            pending = false
-        }
+        request.report(.uploading)
+        let result = try await request.remote.upload(manifest: manifest,
+                                                     archive: archiveURL,
+                                                     precondition: precondition,
+                                                     progress: request.progress)
 
         request.report(.cleanup)
-        return SyncReport(outcome: pending ? .uploadedPendingICloud : .uploaded,
+        return SyncReport(outcome: .uploaded,
                           files: scan.snapshot.fileCount,
                           bytes: scan.snapshot.totalBytes,
                           versionId: versionId,
-                          pendingICloud: pending)
+                          commitSHA: result.commit)
     }
 
     // MARK: - Restore
 
-    public func restore(_ request: SyncRequest) throws -> SyncReport {
-        request.report(.readingManifest)
-        let cloud = CloudStorageManager(root: request.cloudRoot)
-        let manifest = try cloud.loadManifest(gameId: request.gameId)
+    /// Convenience for callers that hold only a request: compares first, then restores.
+    public func restore(_ request: SyncRequest) async throws -> SyncReport {
+        let analysis = await analyze(request)
+        if case .blocked(let error) = analysis.decision, analysis.remoteError != nil {
+            throw error
+        }
+        return try await restore(request, from: analysis)
+    }
 
-        request.report(.waitingDownload)
-        let archiveURL = try cloud.prepareArchive(gameId: request.gameId, manifest: manifest)
+    public func restore(_ request: SyncRequest, from analysis: SyncAnalysis) async throws -> SyncReport {
+        guard let commit = analysis.remoteCommit, let expected = analysis.remote else {
+            throw SyncError.cloudBackupMissing
+        }
 
-        return try installArchive(archiveURL,
-                                  expectedHash: manifest.contentHash,
-                                  expectedCount: manifest.fileCount,
+        // Restoring must not quietly roll the device back to a version that was just superseded.
+        let head = try await request.remote.head()
+        guard head.commit == commit else {
+            throw SyncError.gitHubRemoteChanged
+        }
+
+        let work = try paths.makeWorkDirectory(name: "download")
+        defer { try? FileManager.default.removeItem(at: work) }
+
+        request.report(.downloading)
+        let save = try await request.remote.download(gameId: request.gameId, commit: commit, into: work)
+
+        return try installArchive(save.archiveURL,
+                                  expectedHash: save.manifest.contentHash.isEmpty ? expected.contentHash : save.manifest.contentHash,
+                                  expectedCount: save.manifest.fileCount,
                                   request: request,
-                                  versionId: manifest.versionId,
+                                  versionId: save.manifest.versionId,
+                                  commitSHA: commit,
                                   outcome: .restored)
     }
 
-    public func restoreHistory(_ request: SyncRequest, versionId: String) throws -> SyncReport {
-        request.report(.readingManifest)
-        let cloud = CloudStorageManager(root: request.cloudRoot)
-        let entry = try cloud.loadHistoryEntry(gameId: request.gameId, versionId: versionId)
+    public func restoreHistory(_ request: SyncRequest, commit: String) async throws -> SyncReport {
+        let work = try paths.makeWorkDirectory(name: "history")
+        defer { try? FileManager.default.removeItem(at: work) }
 
-        request.report(.waitingDownload)
-        let archiveURL = try cloud.prepareHistoryArchive(gameId: request.gameId, versionId: versionId)
+        request.report(.downloading)
+        let save = try await request.remote.download(gameId: request.gameId, commit: commit, into: work)
 
-        return try installArchive(archiveURL,
-                                  expectedHash: entry.contentHash,
-                                  expectedCount: entry.fileCount,
+        return try installArchive(save.archiveURL,
+                                  expectedHash: save.manifest.contentHash,
+                                  expectedCount: save.manifest.fileCount,
                                   request: request,
-                                  versionId: entry.versionId,
+                                  versionId: save.manifest.versionId,
+                                  commitSHA: commit,
                                   outcome: .restoredHistory)
     }
 
-    public func restoreLocalBackup(_ request: SyncRequest, backup: LocalBackup) throws -> SyncReport {
+    public func restoreLocalBackup(_ request: SyncRequest, backup: LocalBackup) async throws -> SyncReport {
         request.report(.scanning)
         let payload = backupManager.payloadURL(backup)
         guard FileSystem.isDirectory(payload) else {
@@ -382,7 +438,7 @@ public struct SyncEngine: Sendable {
                                                from: request.localDirectory,
                                                snapshot: currentScan.snapshot,
                                                reason: "before-local-backup-restore",
-                                               keep: request.retention)
+                                               keep: request.localBackupRetention)
         }
 
         request.report(.replacing)
@@ -404,6 +460,7 @@ public struct SyncEngine: Sendable {
                                 expectedCount: Int,
                                 request: SyncRequest,
                                 versionId: String,
+                                commitSHA: String?,
                                 outcome: SyncOutcome) throws -> SyncReport {
         let localDirectory = request.localDirectory
         try ensureLocalDirectory(localDirectory, request: request)
@@ -419,7 +476,7 @@ public struct SyncEngine: Sendable {
                                                         from: localDirectory,
                                                         snapshot: currentScan.snapshot,
                                                         reason: "before-restore-\(versionId)",
-                                                        keep: request.retention)
+                                                        keep: request.localBackupRetention)
             localBackupId = backup?.id
         }
 
@@ -441,11 +498,12 @@ public struct SyncEngine: Sendable {
         try DirectoryReplacer.commit(staging: staging, into: localDirectory)
 
         request.report(.cleanup)
-        Log.write("restored game=\(request.gameId) version=\(versionId) files=\(extracted.fileCount)")
+        Log.write("restored game=\(request.gameId) version=\(versionId) commit=\(commitSHA ?? "-") files=\(extracted.fileCount)")
         return SyncReport(outcome: outcome,
                           files: extracted.fileCount,
                           bytes: extracted.totalBytes,
                           versionId: versionId,
+                          commitSHA: commitSHA,
                           localBackupId: localBackupId)
     }
 

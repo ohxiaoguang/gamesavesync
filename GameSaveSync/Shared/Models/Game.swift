@@ -22,8 +22,15 @@ public struct Game: Codable, Identifiable, Hashable, Sendable {
     /// They still work, but the user is asked to move the grant up to `Documents`.
     public var accessRootIsLegacy: Bool
     public var lastLocalModified: Date?
+    /// Newest save time reported by the remote manifest. Informational only: it is never used to
+    /// decide direction on its own, and it is not written by the old iCloud build in a way that
+    /// could imply a GitHub sync.
     public var lastCloudModified: Date?
     public var lastSync: SyncRecord?
+    /// `RemoteStore.identifier` of the remote `lastSync` refers to. A record written before the
+    /// GitHub migration (or by the old iCloud flow) leaves this nil, so the first GitHub sync still
+    /// asks for confirmation even though `lastSync` exists.
+    public var syncedRemoteId: String?
     public var createdAt: Date
     public var updatedAt: Date
 
@@ -37,6 +44,7 @@ public struct Game: Codable, Identifiable, Hashable, Sendable {
                 lastLocalModified: Date? = nil,
                 lastCloudModified: Date? = nil,
                 lastSync: SyncRecord? = nil,
+                syncedRemoteId: String? = nil,
                 createdAt: Date = Date(),
                 updatedAt: Date = Date()) {
         self.id = id
@@ -49,8 +57,14 @@ public struct Game: Codable, Identifiable, Hashable, Sendable {
         self.lastLocalModified = lastLocalModified
         self.lastCloudModified = lastCloudModified
         self.lastSync = lastSync
+        self.syncedRemoteId = syncedRemoteId
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    /// True only when the previous successful sync was against this exact remote.
+    public func hasSynced(with remoteIdentifier: String) -> Bool {
+        lastSync?.isSuccess == true && syncedRemoteId == remoteIdentifier
     }
 
     /// What the UI shows for the sync target: `Documents` or `Documents / saves`.
@@ -70,6 +84,7 @@ public struct Game: Codable, Identifiable, Hashable, Sendable {
         // Written by versions that only knew about a single folder.
         case localFolderBookmark, localFolderHint
         case lastLocalModified, lastCloudModified, lastSync, createdAt, updatedAt
+        case syncedRemoteId
     }
 
     public init(from decoder: Decoder) throws {
@@ -99,6 +114,7 @@ public struct Game: Codable, Identifiable, Hashable, Sendable {
         lastLocalModified = try container.decodeIfPresent(Date.self, forKey: .lastLocalModified)
         lastCloudModified = try container.decodeIfPresent(Date.self, forKey: .lastCloudModified)
         lastSync = try container.decodeIfPresent(SyncRecord.self, forKey: .lastSync)
+        syncedRemoteId = try container.decodeIfPresent(String.self, forKey: .syncedRemoteId)
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
     }
@@ -115,6 +131,7 @@ public struct Game: Codable, Identifiable, Hashable, Sendable {
         try container.encodeIfPresent(lastLocalModified, forKey: .lastLocalModified)
         try container.encodeIfPresent(lastCloudModified, forKey: .lastCloudModified)
         try container.encodeIfPresent(lastSync, forKey: .lastSync)
+        try container.encodeIfPresent(syncedRemoteId, forKey: .syncedRemoteId)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(updatedAt, forKey: .updatedAt)
     }
@@ -123,11 +140,29 @@ public struct Game: Codable, Identifiable, Hashable, Sendable {
 public struct SyncRecord: Codable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case uploaded
-        case uploadedPendingICloud
         case restored
         case restoredHistory
         case upToDate
         case failed
+
+        /// Tolerant decoding: `games.json` written by the iCloud build contains
+        /// `uploadedPendingICloud`, which no longer exists. An unknown value must never make the
+        /// whole file undecodable, because that would drop every game configuration.
+        public init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            switch raw {
+            case "uploaded", "uploadedPendingICloud":
+                self = .uploaded
+            case "restored":
+                self = .restored
+            case "restoredHistory":
+                self = .restoredHistory
+            case "upToDate":
+                self = .upToDate
+            default:
+                self = .failed
+            }
+        }
     }
 
     public var kind: Kind
@@ -153,28 +188,27 @@ public struct SyncRecord: Codable, Hashable, Sendable {
 }
 
 public struct AppSettings: Codable, Hashable, Sendable {
-    public var cloudRootBookmark: Data?
-    public var cloudRootHint: String?
-    public var historyRetention: Int
+    // GitHub archive repository.
+    public var gitHubOwner: String
+    public var gitHubName: String
+    public var gitHubBranch: String
+    /// How many local safety copies of a save folder are kept in the app container.
+    public var localBackupRetention: Int
     public var language: AppLanguage
     public var deviceName: String
-    public var cloudRootIsICloud: Bool
-    public var cloudSubpath: String
 
-    public init(cloudRootBookmark: Data? = nil,
-                cloudRootHint: String? = nil,
-                historyRetention: Int = 3,
+    public init(gitHubOwner: String = "",
+                gitHubName: String = "",
+                gitHubBranch: String = GitHubRepository.fallbackBranch,
+                localBackupRetention: Int = 3,
                 language: AppLanguage = .system,
-                deviceName: String = AppSettings.defaultDeviceName,
-                cloudRootIsICloud: Bool = false,
-                cloudSubpath: String = "GameSaveSync") {
-        self.cloudRootBookmark = cloudRootBookmark
-        self.cloudRootHint = cloudRootHint
-        self.historyRetention = historyRetention
+                deviceName: String = AppSettings.defaultDeviceName) {
+        self.gitHubOwner = gitHubOwner
+        self.gitHubName = gitHubName
+        self.gitHubBranch = gitHubBranch
+        self.localBackupRetention = localBackupRetention
         self.language = language
         self.deviceName = deviceName
-        self.cloudRootIsICloud = cloudRootIsICloud
-        self.cloudSubpath = cloudSubpath
     }
 
     public static var defaultDeviceName: String {
@@ -187,21 +221,52 @@ public struct AppSettings: Codable, Hashable, Sendable {
 
     public var localizer: Localizer { Localizer(language: language.resolved) }
 
+    /// The repository the user configured. It is empty until they fill it in: the source
+    /// repository is never used as a default.
+    public var repository: GitHubRepository {
+        get {
+            GitHubRepository(owner: gitHubOwner,
+                             name: gitHubName,
+                             branch: gitHubBranch.isEmpty ? GitHubRepository.fallbackBranch : gitHubBranch)
+        }
+        set {
+            gitHubOwner = newValue.owner
+            gitHubName = newValue.name
+            gitHubBranch = newValue.trimmedBranch
+        }
+    }
+
     enum CodingKeys: String, CodingKey {
-        case cloudRootBookmark, cloudRootHint, historyRetention, language, deviceName, cloudRootIsICloud, cloudSubpath
+        case gitHubOwner, gitHubName, gitHubBranch, localBackupRetention, language, deviceName
+        // Written by the iCloud build; only used to migrate the local retention default.
+        case historyRetention
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        cloudRootBookmark = try container.decodeIfPresent(Data.self, forKey: .cloudRootBookmark)
-        cloudRootHint = try container.decodeIfPresent(String.self, forKey: .cloudRootHint)
-        historyRetention = try container.decodeIfPresent(Int.self, forKey: .historyRetention) ?? 3
+        gitHubOwner = (try container.decodeIfPresent(String.self, forKey: .gitHubOwner)) ?? ""
+        gitHubName = (try container.decodeIfPresent(String.self, forKey: .gitHubName)) ?? ""
+        let branch = try container.decodeIfPresent(String.self, forKey: .gitHubBranch) ?? ""
+        gitHubBranch = branch.isEmpty ? GitHubRepository.fallbackBranch : branch
         language = try container.decodeIfPresent(AppLanguage.self, forKey: .language) ?? .system
         deviceName = try container.decodeIfPresent(String.self, forKey: .deviceName) ?? AppSettings.defaultDeviceName
-        cloudRootIsICloud = try container.decodeIfPresent(Bool.self, forKey: .cloudRootIsICloud) ?? false
-        cloudSubpath = try container.decodeIfPresent(String.self, forKey: .cloudSubpath) ?? "GameSaveSync"
-        if historyRetention < 1 { historyRetention = 1 }
-        if historyRetention > 20 { historyRetention = 20 }
+
+        // The old build only had a cloud history count; carrying it over keeps the local safety
+        // copy count the user had chosen instead of silently resetting it to the default.
+        let retention = try container.decodeIfPresent(Int.self, forKey: .localBackupRetention)
+            ?? container.decodeIfPresent(Int.self, forKey: .historyRetention)
+            ?? 3
+        localBackupRetention = min(max(retention, 1), 20)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(gitHubOwner, forKey: .gitHubOwner)
+        try container.encode(gitHubName, forKey: .gitHubName)
+        try container.encode(gitHubBranch, forKey: .gitHubBranch)
+        try container.encode(localBackupRetention, forKey: .localBackupRetention)
+        try container.encode(language, forKey: .language)
+        try container.encode(deviceName, forKey: .deviceName)
     }
 }
 

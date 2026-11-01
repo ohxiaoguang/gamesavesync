@@ -6,7 +6,7 @@ final class LocalAccessTests: XCTestCase {
     private var root: URL!
     private var paths: AppPaths!
     private var engine: SyncEngine!
-    private var cloud: URL!
+    private var harness: GitHubTestHarness!
     private var documentsA: URL!
     private var documentsB: URL!
     private let gameId = "split-game"
@@ -15,16 +15,16 @@ final class LocalAccessTests: XCTestCase {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("gss-access-\(UUID().uuidString)")
         paths = AppPaths(container: root.appendingPathComponent("app"))
         engine = SyncEngine(paths: paths)
-        cloud = root.appendingPathComponent("cloud")
+        harness = GitHubTestHarness()
         documentsA = root.appendingPathComponent("A/Documents")
         documentsB = root.appendingPathComponent("B/Documents")
-        try TestSupport.makeDirectory(cloud)
         try TestSupport.makeDirectory(documentsA.appendingPathComponent("saves"))
         try TestSupport.makeDirectory(documentsB.appendingPathComponent("saves"))
     }
 
     override func tearDownWithError() throws {
         try? FileManager.default.removeItem(at: root)
+        harness = nil
     }
 
     // MARK: - Helpers
@@ -42,16 +42,12 @@ final class LocalAccessTests: XCTestCase {
     }
 
     private func request(_ access: LocalAccess, hasSyncedBefore: Bool = true) -> SyncRequest {
-        SyncRequest(gameId: gameId,
-                    gameName: "Split",
-                    localDirectory: access.syncDirectory,
-                    accessRoot: access.root,
-                    syncRelativePath: access.relativePath,
-                    cloudRoot: cloud,
-                    retention: 3,
-                    deviceName: "TestDevice",
-                    appVersion: "1.0",
-                    hasSyncedBefore: hasSyncedBefore)
+        harness.makeRequest(gameId: gameId,
+                            gameName: "Split",
+                            localDirectory: access.syncDirectory,
+                            accessRoot: access.root,
+                            syncRelativePath: access.relativePath,
+                            hasSyncedBefore: hasSyncedBefore)
     }
 
     private func seedDocuments(_ documents: URL, savesStamp: Date) throws {
@@ -200,24 +196,24 @@ final class LocalAccessTests: XCTestCase {
     }
 
     // MARK: - Upload scope
-    func testUploadOnlyIncludesTheSyncSubfolder() throws {
+    func testUploadOnlyIncludesTheSyncSubfolder() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try seedDocuments(documentsA, savesStamp: stamp)
 
         let access = try resolved(try game(rootURL: documentsA, relativePath: "saves"))
-        let report = try engine.upload(request(access))
+        let report = try await engine.upload(request(access))
 
         XCTAssertEqual(report.files, 2, "only the two files inside saves may be uploaded")
-        let manifest = try TestSupport.manifest(at: cloud, gameId: gameId)
+        let manifest = try XCTUnwrap(harness.manifest(gameId: gameId))
         XCTAssertEqual(manifest.fileCount, 2)
         XCTAssertEqual(manifest.saveModifiedAt!.timeIntervalSince1970, stamp.timeIntervalSince1970, accuracy: 0.01)
     }
 
-    func testRestoreLeavesDocumentsAndSiblingsUntouched() throws {
+    func testRestoreLeavesDocumentsAndSiblingsUntouched() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try seedDocuments(documentsA, savesStamp: stamp)
         let accessA = try resolved(try game(rootURL: documentsA, relativePath: "saves"))
-        _ = try engine.upload(request(accessA))
+        _ = try await engine.upload(request(accessA))
 
         // The second device has its own caches and an older save slot.
         let older = stamp.addingTimeInterval(-3600)
@@ -226,7 +222,7 @@ final class LocalAccessTests: XCTestCase {
         try TestSupport.write(documentsB, "config.json", "{\"volume\":2}", modified: stamp)
 
         let accessB = try resolved(try game(rootURL: documentsB, relativePath: "saves"))
-        let report = try engine.restore(request(accessB))
+        let report = try await engine.restore(request(accessB))
         XCTAssertEqual(report.outcome, .restored)
 
         XCTAssertEqual(TestSupport.contents(documentsB, "saves/slot1.sav"), "alpha")
@@ -241,19 +237,19 @@ final class LocalAccessTests: XCTestCase {
         XCTAssertTrue(FileSystem.isDirectory(documentsB), "the authorised folder itself must survive")
     }
 
-    func testSyncFolderCanBeTheAuthorisedRootItself() throws {
+    func testSyncFolderCanBeTheAuthorisedRootItself() async throws {
         let stamp = TestSupport.date("2026-10-31T18:00:00.000Z")
         try seedDocuments(documentsA, savesStamp: stamp)
 
         let access = try resolved(try game(rootURL: documentsA, relativePath: ""))
         XCTAssertEqual(access.syncDirectory.standardizedFileURL.path, documentsA.standardizedFileURL.path)
 
-        let report = try engine.upload(request(access))
+        let report = try await engine.upload(request(access))
         XCTAssertEqual(report.files, 4, "choosing the root syncs everything inside it")
 
         let accessB = try resolved(try game(rootURL: documentsB, relativePath: ""))
         try TestSupport.write(documentsB, "saves/old.sav", "stale", modified: stamp.addingTimeInterval(-60))
-        let restored = try engine.restore(request(accessB))
+        let restored = try await engine.restore(request(accessB))
         XCTAssertEqual(restored.outcome, .restored)
         XCTAssertTrue(FileSystem.isDirectory(documentsB), "replacing the root must keep the root folder itself")
         XCTAssertEqual(TestSupport.contents(documentsB, "config.json"), "{\"volume\":1}")
@@ -261,7 +257,7 @@ final class LocalAccessTests: XCTestCase {
 
     // MARK: - A recreated save folder
 
-    func testSaveFolderCanBeRecreatedAtTheSamePath() throws {
+    func testSaveFolderCanBeRecreatedAtTheSamePath() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try seedDocuments(documentsA, savesStamp: stamp)
         let game = try game(rootURL: documentsA, relativePath: "saves")
@@ -278,17 +274,17 @@ final class LocalAccessTests: XCTestCase {
         XCTAssertEqual(second.root.standardizedFileURL.path, first.root.standardizedFileURL.path,
                        "the grant still points at Documents, not at the recreated folder")
 
-        let report = try engine.upload(request(second))
+        let report = try await engine.upload(request(second))
         XCTAssertEqual(report.outcome, .uploaded)
-        XCTAssertEqual(try TestSupport.manifest(at: cloud, gameId: gameId).fileCount, 1)
+        XCTAssertEqual(try XCTUnwrap(harness.manifest(gameId: gameId)).fileCount, 1)
     }
 
-    func testMissingSaveFolderIsReportedAsMissingNotAsLostAccess() throws {
+    func testMissingSaveFolderIsReportedAsMissingNotAsLostAccess() async throws {
         let game = try game(rootURL: documentsA, relativePath: "saves")
         try FileManager.default.removeItem(at: documentsA.appendingPathComponent("saves"))
 
         let access = try resolved(game)
-        let analysis = engine.analyze(request(access))
+        let analysis = await engine.analyze(request(access))
         guard case .blocked(let error) = analysis.decision else {
             return XCTFail("expected a blocked decision, got \(analysis.decision)")
         }
@@ -296,30 +292,30 @@ final class LocalAccessTests: XCTestCase {
         XCTAssertTrue(FileSystem.isDirectory(documentsA), "the authorised root is still readable")
     }
 
-    func testMissingSaveFolderBecomesADownloadInsteadOfAnError() throws {
+    func testMissingSaveFolderBecomesADownloadInsteadOfAnError() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try seedDocuments(documentsA, savesStamp: stamp)
         let accessA = try resolved(try game(rootURL: documentsA, relativePath: "saves"))
-        _ = try engine.upload(request(accessA))
+        _ = try await engine.upload(request(accessA))
 
         try FileManager.default.removeItem(at: documentsB.appendingPathComponent("saves"))
         let accessB = try resolved(try game(rootURL: documentsB, relativePath: "saves"))
-        let analysis = engine.analyze(request(accessB))
+        let analysis = await engine.analyze(request(accessB))
 
         XCTAssertEqual(analysis.localError, .syncFolderMissing("saves"))
         XCTAssertEqual(analysis.decision, .download(.localEmpty),
                        "a missing sync folder must be fetched, not reported as lost access")
     }
 
-    func testMissingSaveFolderIsFilledByRestore() throws {
+    func testMissingSaveFolderIsFilledByRestore() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try seedDocuments(documentsA, savesStamp: stamp)
         let accessA = try resolved(try game(rootURL: documentsA, relativePath: "saves"))
-        _ = try engine.upload(request(accessA))
+        _ = try await engine.upload(request(accessA))
 
         try FileManager.default.removeItem(at: documentsB.appendingPathComponent("saves"))
         let accessB = try resolved(try game(rootURL: documentsB, relativePath: "saves"))
-        let report = try engine.restore(request(accessB))
+        let report = try await engine.restore(request(accessB))
 
         XCTAssertEqual(report.outcome, .restored)
         XCTAssertEqual(TestSupport.contents(documentsB, "saves/slot1.sav"), "alpha")

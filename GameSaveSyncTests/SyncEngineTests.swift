@@ -5,7 +5,7 @@ final class SyncEngineTests: XCTestCase {
     private var root: URL!
     private var paths: AppPaths!
     private var engine: SyncEngine!
-    private var cloud: URL!
+    private var harness: GitHubTestHarness!
     private var deviceA: URL!
     private var deviceB: URL!
     private let gameId = "test-game"
@@ -14,45 +14,39 @@ final class SyncEngineTests: XCTestCase {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("gss-engine-\(UUID().uuidString)")
         paths = AppPaths(container: root.appendingPathComponent("app"))
         engine = SyncEngine(paths: paths)
-        cloud = root.appendingPathComponent("cloud")
+        harness = GitHubTestHarness()
         deviceA = root.appendingPathComponent("A/saves")
         deviceB = root.appendingPathComponent("B/saves")
-        try TestSupport.makeDirectory(cloud)
         try TestSupport.makeDirectory(deviceA)
         try TestSupport.makeDirectory(deviceB)
     }
 
     override func tearDownWithError() throws {
         try? FileManager.default.removeItem(at: root)
+        harness = nil
     }
 
     private func request(_ local: URL, hasSyncedBefore: Bool = true, retention: Int = 3) -> SyncRequest {
-        SyncRequest(gameId: gameId,
-                    gameName: "Test Game",
-                    localDirectory: local,
-                    cloudRoot: cloud,
-                    retention: retention,
-                    deviceName: "TestDevice",
-                    appVersion: "1.0",
-                    hasSyncedBefore: hasSyncedBefore)
+        harness.makeRequest(gameId: gameId,
+                            localDirectory: local,
+                            hasSyncedBefore: hasSyncedBefore,
+                            retention: retention)
     }
 
     // MARK: - Upload
 
-    func testUploadWritesManifestAndArchive() throws {
+    func testFirstUploadCreatesACommitWithManifestAndArchive() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try TestSupport.write(deviceA, "slot1.sav", "alpha", modified: stamp)
         try TestSupport.write(deviceA, "profile/settings.ini", "beta", modified: stamp.addingTimeInterval(-60))
 
-        let report = try engine.upload(request(deviceA))
+        let report = try await engine.upload(request(deviceA))
         XCTAssertEqual(report.outcome, .uploaded)
         XCTAssertEqual(report.files, 2)
+        XCTAssertNotNil(report.commitSHA)
+        XCTAssertEqual(harness.server.headCommit, report.commitSHA)
 
-        let gameFolder = cloud.appendingPathComponent(gameId)
-        XCTAssertTrue(FileSystem.exists(gameFolder.appendingPathComponent("latest.zip")))
-        XCTAssertTrue(FileSystem.exists(gameFolder.appendingPathComponent("manifest.json")))
-
-        let manifest = try TestSupport.manifest(at: cloud, gameId: gameId)
+        let manifest = try XCTUnwrap(harness.manifest(gameId: gameId))
         XCTAssertEqual(manifest.gameId, gameId)
         XCTAssertEqual(manifest.fileCount, 2)
         XCTAssertEqual(manifest.status, .complete)
@@ -61,22 +55,75 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertGreaterThan(manifest.archiveBytes, 0)
     }
 
-    func testEmptyFolderIsNotUploaded() throws {
-        XCTAssertThrowsError(try engine.upload(request(deviceA))) { error in
+    func testManifestAndArchiveLiveInTheSameCommit() async throws {
+        try TestSupport.write(deviceA, "slot1.sav", "alpha", modified: TestSupport.date("2026-10-31T20:30:00.000Z"))
+        let firstUpload = try await engine.upload(request(deviceA))
+        try TestSupport.write(deviceA, "slot1.sav", "alpha-v2", modified: TestSupport.date("2026-11-01T09:00:00.000Z"))
+        let second = try await engine.upload(request(deviceA))
+
+        let commit = try XCTUnwrap(second.commitSHA)
+        let manifest = try XCTUnwrap(harness.server.manifest(at: commit, gameId: gameId))
+        let archive = try XCTUnwrap(harness.server.archiveData(at: commit, gameId: gameId))
+
+        // The archive the commit points at must match the manifest in the same commit.
+        XCTAssertEqual(Hashing.sha256Hex(archive), manifest.archiveSHA256)
+        XCTAssertEqual(Int(archive.count), manifest.archiveBytes)
+
+        // And the previous commit still holds the old pair.
+        let firstCommit = try XCTUnwrap(firstUpload.commitSHA)
+        XCTAssertNotEqual(firstCommit, commit)
+        let oldManifest = try XCTUnwrap(harness.server.manifest(at: firstCommit, gameId: gameId))
+        XCTAssertNotEqual(oldManifest.contentHash, manifest.contentHash)
+    }
+
+    func testSecondUploadKeepsOtherGamesIntact() async throws {
+        try TestSupport.write(deviceA, "slot1.sav", "alpha", modified: TestSupport.date("2026-10-31T20:30:00.000Z"))
+
+        // Another game already in the repository.
+        let otherManifest = CloudManifest(gameId: "other-game",
+                                          gameName: "Other",
+                                          versionId: "v-other",
+                                          saveModifiedAt: Date(),
+                                          saveWasEmpty: false,
+                                          backupCreatedAt: Date(),
+                                          sourceDevice: "Device X",
+                                          sourceAppVersion: "1.0",
+                                          contentHash: "hash-other",
+                                          fileCount: 3,
+                                          totalBytes: 42,
+                                          archiveBytes: 10,
+                                          archiveSHA256: "abc")
+        harness.server.simulateRemoteUpload(gameId: "other-game",
+                                            manifest: otherManifest,
+                                            archive: Data("other-zip".utf8))
+
+        let upload = try await engine.upload(request(deviceA))
+        let commit = try XCTUnwrap(upload.commitSHA)
+
+        XCTAssertNotNil(harness.server.manifest(at: commit, gameId: "other-game"),
+                        "a commit for one game must never delete another game")
+        XCTAssertNotNil(harness.server.manifest(at: commit, gameId: gameId))
+    }
+
+    func testEmptyFolderIsNotUploaded() async throws {
+        do {
+            _ = try await engine.upload(request(deviceA))
+            XCTFail("an empty folder must not be uploaded")
+        } catch {
             XCTAssertEqual(error as? SyncError, .emptyLocalSave)
         }
-        XCTAssertFalse(FileSystem.exists(cloud.appendingPathComponent(gameId).appendingPathComponent("manifest.json")))
+        XCTAssertTrue(harness.server.repositoryIsEmpty)
     }
 
     // MARK: - Restore
 
-    func testRestoreCopiesFilesAndPreservesModificationTimes() throws {
+    func testRestoreCopiesFilesAndPreservesModificationTimes() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try TestSupport.write(deviceA, "slot1.sav", "alpha", modified: stamp)
         try TestSupport.write(deviceA, "deep/dir/slot2.sav", "beta", modified: stamp.addingTimeInterval(-3600))
-        _ = try engine.upload(request(deviceA))
+        _ = try await engine.upload(request(deviceA))
 
-        let report = try engine.restore(request(deviceB))
+        let report = try await engine.restore(request(deviceB))
         XCTAssertEqual(report.outcome, .restored)
         XCTAssertEqual(report.files, 2)
 
@@ -87,120 +134,181 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(restored!.timeIntervalSince1970, stamp.timeIntervalSince1970, accuracy: 0.05)
     }
 
-    func testRestoreRemovesFilesThatAreNotInTheCloud() throws {
+    func testRestoreRemovesFilesThatAreNotOnTheRemote() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
-        try TestSupport.write(deviceA, "keep.sav", "cloud", modified: stamp)
-        _ = try engine.upload(request(deviceA))
+        try TestSupport.write(deviceA, "keep.sav", "remote", modified: stamp)
+        _ = try await engine.upload(request(deviceA))
 
         try TestSupport.write(deviceB, "keep.sav", "old", modified: stamp.addingTimeInterval(-9999))
         try TestSupport.write(deviceB, "stale.sav", "should disappear", modified: stamp.addingTimeInterval(-9999))
         try TestSupport.makeDirectory(deviceB.appendingPathComponent("emptydir"))
 
-        _ = try engine.restore(request(deviceB))
+        _ = try await engine.restore(request(deviceB))
 
-        XCTAssertEqual(TestSupport.contents(deviceB, "keep.sav"), "cloud")
+        XCTAssertEqual(TestSupport.contents(deviceB, "keep.sav"), "remote")
         XCTAssertNil(TestSupport.contents(deviceB, "stale.sav"))
         XCTAssertEqual(TestSupport.relativeFileList(deviceB), ["keep.sav"])
     }
 
-    func testRestoreCreatesLocalFolderWhenMissing() throws {
+    func testRestoreCreatesLocalFolderWhenMissing() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try TestSupport.write(deviceA, "slot.sav", "alpha", modified: stamp)
-        _ = try engine.upload(request(deviceA))
+        _ = try await engine.upload(request(deviceA))
 
         let fresh = root.appendingPathComponent("C/saves")
-        let report = try engine.restore(request(fresh))
+        let report = try await engine.restore(request(fresh))
         XCTAssertEqual(report.outcome, .restored)
         XCTAssertEqual(TestSupport.contents(fresh, "slot.sav"), "alpha")
     }
 
     // MARK: - Analysis
 
-    func testAnalysisDetectsCloudNewerThanLocal() throws {
-        let cloudStamp = TestSupport.date("2026-10-31T20:30:00.000Z")
-        try TestSupport.write(deviceA, "slot.sav", "cloud-version", modified: cloudStamp)
-        _ = try engine.upload(request(deviceA))
+    func testAnalysisDetectsRemoteNewerThanLocal() async throws {
+        let remoteStamp = TestSupport.date("2026-10-31T20:30:00.000Z")
+        try TestSupport.write(deviceA, "slot.sav", "remote-version", modified: remoteStamp)
+        _ = try await engine.upload(request(deviceA))
 
-        try TestSupport.write(deviceB, "slot.sav", "old-local", modified: cloudStamp.addingTimeInterval(-7200))
-        let analysis = engine.analyze(request(deviceB))
+        try TestSupport.write(deviceB, "slot.sav", "old-local", modified: remoteStamp.addingTimeInterval(-7200))
+        let analysis = await engine.analyze(request(deviceB))
         XCTAssertEqual(analysis.decision, .download(.cloudNewer))
     }
 
-    func testAnalysisDetectsLocalNewer() throws {
-        let cloudStamp = TestSupport.date("2026-10-31T20:30:00.000Z")
-        try TestSupport.write(deviceA, "slot.sav", "cloud-version", modified: cloudStamp)
-        _ = try engine.upload(request(deviceA))
+    func testAnalysisDetectsLocalNewer() async throws {
+        let remoteStamp = TestSupport.date("2026-10-31T20:30:00.000Z")
+        try TestSupport.write(deviceA, "slot.sav", "remote-version", modified: remoteStamp)
+        _ = try await engine.upload(request(deviceA))
 
-        try TestSupport.write(deviceB, "slot.sav", "new-local", modified: cloudStamp.addingTimeInterval(7200))
-        let analysis = engine.analyze(request(deviceB))
+        try TestSupport.write(deviceB, "slot.sav", "new-local", modified: remoteStamp.addingTimeInterval(7200))
+        let analysis = await engine.analyze(request(deviceB))
         XCTAssertEqual(analysis.decision, .upload(.localNewer))
     }
 
-    func testAnalysisTreatsIdenticalContentAsUpToDate() throws {
+    func testAnalysisTreatsIdenticalContentAsUpToDate() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try TestSupport.write(deviceA, "slot.sav", "same", modified: stamp)
-        _ = try engine.upload(request(deviceA))
+        _ = try await engine.upload(request(deviceA))
 
         // Same bytes, different mtime (e.g. copied by another tool).
         try TestSupport.write(deviceB, "slot.sav", "same", modified: stamp.addingTimeInterval(86_400))
-        let analysis = engine.analyze(request(deviceB))
+        let analysis = await engine.analyze(request(deviceB))
         XCTAssertEqual(analysis.decision, .upToDate)
     }
 
-    func testSyncReturnsConflictWithoutWriting() throws {
+    func testSyncReturnsConflictWithoutWriting() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
-        try TestSupport.write(deviceA, "slot.sav", "cloud-version", modified: stamp)
-        _ = try engine.upload(request(deviceA))
+        try TestSupport.write(deviceA, "slot.sav", "remote-version", modified: stamp)
+        _ = try await engine.upload(request(deviceA))
 
         try TestSupport.write(deviceB, "slot.sav", "local-version", modified: stamp)
-        let report = try engine.sync(request(deviceB))
+        let report = try await engine.sync(request(deviceB))
         XCTAssertEqual(report.outcome, .conflictPending)
         XCTAssertEqual(TestSupport.contents(deviceB, "slot.sav"), "local-version", "conflict must never overwrite silently")
     }
 
+    func testForcedUploadAbortsWhenTheSameGameChangedAfterAnalysis() async throws {
+        let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
+        try TestSupport.write(deviceA, "slot.sav", "first", modified: stamp)
+        _ = try await engine.upload(request(deviceA))
+
+        // Another device publishes a new version of this game between our analysis and our write.
+        var otherDevice = try XCTUnwrap(harness.manifest(gameId: gameId))
+        otherDevice.versionId = "from-other-device"
+        otherDevice.contentHash = "hash-from-other-device"
+        harness.server.beforeRefUpdate = { server in
+            server.simulateRemoteUpload(gameId: "test-game",
+                                        manifest: otherDevice,
+                                        archive: Data("other-device-zip".utf8))
+        }
+
+        try TestSupport.write(deviceA, "slot.sav", "mine-newer", modified: stamp.addingTimeInterval(3600))
+        do {
+            _ = try await engine.perform(request(deviceA), direction: .upload)
+            XCTFail("an explicit upload must not overwrite a version it never saw")
+        } catch {
+            XCTAssertEqual(error as? SyncError, .gitHubRemoteChanged)
+        }
+        XCTAssertEqual(harness.manifest(gameId: gameId)?.contentHash, "hash-from-other-device",
+                       "the other device's version must survive a forced upload")
+    }
+
+    func testLegacySyncRecordDoesNotSkipTheFirstGitHubConfirmation() async throws {
+        let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
+        try TestSupport.write(deviceA, "slot.sav", "remote-version", modified: stamp)
+        _ = try await engine.upload(request(deviceA))
+
+        // A device that synced with the old iCloud folder has a successful record but no remote id.
+        try TestSupport.write(deviceB, "slot.sav", "local-newer", modified: stamp.addingTimeInterval(3600))
+        let analysis = await engine.analyze(request(deviceB, hasSyncedBefore: false))
+        XCTAssertEqual(analysis.decision, .upload(.localNewer))
+        XCTAssertEqual(analysis.confirmation, .firstSyncOverwrite(.upload))
+    }
+
     // MARK: - Safety
 
-    func testCorruptCloudArchiveIsRejectedAndLocalUntouched() throws {
+    func testCorruptRemoteArchiveIsRejectedAndLocalUntouched() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
-        try TestSupport.write(deviceA, "slot.sav", "cloud-version", modified: stamp)
-        _ = try engine.upload(request(deviceA))
+        try TestSupport.write(deviceA, "slot.sav", "remote-version", modified: stamp)
+        _ = try await engine.upload(request(deviceA))
 
         try TestSupport.write(deviceB, "slot.sav", "local-version", modified: stamp.addingTimeInterval(-3600))
+        harness.server.corruptArchiveDownloads = true
 
-        // Corrupt the archive: the manifest hash no longer matches.
-        let archive = cloud.appendingPathComponent(gameId).appendingPathComponent("latest.zip")
-        var data = try Data(contentsOf: archive)
-        data.append(Data(repeating: 0x00, count: 16))
-        try data.write(to: archive)
-
-        XCTAssertThrowsError(try engine.restore(request(deviceB))) { error in
+        do {
+            _ = try await engine.restore(request(deviceB))
+            XCTFail("a corrupted archive must not be restored")
+        } catch {
             XCTAssertEqual(error as? SyncError, .cloudVerificationFailed)
         }
         XCTAssertEqual(TestSupport.contents(deviceB, "slot.sav"), "local-version")
     }
 
-    func testIncompleteManifestBlocksSync() throws {
+    func testIncompleteManifestBlocksSync() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
-        try TestSupport.write(deviceA, "slot.sav", "cloud-version", modified: stamp)
-        _ = try engine.upload(request(deviceA))
+        try TestSupport.write(deviceA, "slot.sav", "remote-version", modified: stamp)
+        _ = try await engine.upload(request(deviceA))
 
-        let manifestURL = cloud.appendingPathComponent(gameId).appendingPathComponent("manifest.json")
-        var manifest = try TestSupport.manifest(at: cloud, gameId: gameId)
+        // Replace the remote manifest with an incomplete one.
+        var manifest = try XCTUnwrap(harness.manifest(gameId: gameId))
         manifest.status = .incomplete
-        try Coders.encode(manifest).write(to: manifestURL)
+        harness.server.simulateRemoteUpload(gameId: gameId,
+                                            manifest: manifest,
+                                            archive: Data("unused".utf8))
 
-        let analysis = engine.analyze(request(deviceB))
-        XCTAssertEqual(analysis.decision, .blocked(.cloudBackupIncomplete))
-        XCTAssertThrowsError(try engine.sync(request(deviceB)))
+        do {
+            _ = try await engine.restore(request(deviceB))
+            XCTFail("an incomplete manifest must block the restore")
+        } catch {
+            XCTAssertEqual(error as? SyncError, .cloudBackupIncomplete)
+        }
     }
 
-    func testRestoreCreatesLocalSafetyBackup() throws {
+    func testLostConnectionDuringRestoreLeavesLocalSavesUntouched() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
-        try TestSupport.write(deviceA, "slot.sav", "cloud-version", modified: stamp)
-        _ = try engine.upload(request(deviceA))
+        try TestSupport.write(deviceA, "slot.sav", "remote-version", modified: stamp)
+        _ = try await engine.upload(request(deviceA))
 
         try TestSupport.write(deviceB, "slot.sav", "local-version", modified: stamp.addingTimeInterval(-3600))
-        let report = try engine.restore(request(deviceB))
+        let analysis = await engine.analyze(request(deviceB))
+        XCTAssertEqual(analysis.decision.direction, .download)
+
+        harness.server.persistentFault = .network(.notConnectedToInternet)
+        do {
+            _ = try await engine.restore(request(deviceB), from: analysis)
+            XCTFail("a lost connection must not replace the local saves")
+        } catch {
+            XCTAssertEqual(error as? SyncError, .networkUnavailable)
+        }
+        harness.server.persistentFault = nil
+        XCTAssertEqual(TestSupport.contents(deviceB, "slot.sav"), "local-version")
+    }
+
+    func testRestoreCreatesLocalSafetyBackup() async throws {
+        let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
+        try TestSupport.write(deviceA, "slot.sav", "remote-version", modified: stamp)
+        _ = try await engine.upload(request(deviceA))
+
+        try TestSupport.write(deviceB, "slot.sav", "local-version", modified: stamp.addingTimeInterval(-3600))
+        let report = try await engine.restore(request(deviceB))
 
         XCTAssertNotNil(report.localBackupId)
         let backups = engine.localBackups(gameId: gameId)
@@ -210,75 +318,77 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(TestSupport.contents(payload, "slot.sav"), "local-version")
 
         // And the backup can be restored again.
-        _ = try engine.restoreLocalBackup(request(deviceB), backup: backups[0])
+        _ = try await engine.restoreLocalBackup(request(deviceB), backup: backups[0])
         XCTAssertEqual(TestSupport.contents(deviceB, "slot.sav"), "local-version")
     }
 
-    func testHistoryRetentionKeepsConfiguredNumber() throws {
-        let base = TestSupport.date("2026-10-01T10:00:00.000Z")
-        for index in 0..<5 {
-            let stamp = base.addingTimeInterval(Double(index) * 86_400)
-            try TestSupport.write(deviceA, "slot.sav", "version-\(index)", modified: stamp)
-            _ = try engine.upload(request(deviceA, retention: 3))
-        }
+    // MARK: - History
 
-        let history = engine.history(request(deviceA))
-        XCTAssertEqual(history.count, 3)
-        // Newest first.
-        XCTAssertTrue(history[0].backupCreatedAt >= history[1].backupCreatedAt)
-
-        let historyFolder = cloud.appendingPathComponent(gameId).appendingPathComponent("history")
-        let files = try FileManager.default.contentsOfDirectory(atPath: historyFolder.path)
-        XCTAssertEqual(files.filter { $0.hasSuffix(".zip") }.count, 3)
-        XCTAssertEqual(files.filter { $0.hasSuffix(".json") }.count, 3)
-    }
-
-    func testHistoryVersionCanBeRestored() throws {
+    func testHistoryIsOneCommitPerUploadAndCanBeRestored() async throws {
         let base = TestSupport.date("2026-10-01T10:00:00.000Z")
         try TestSupport.write(deviceA, "slot.sav", "first", modified: base)
-        _ = try engine.upload(request(deviceA))
+        _ = try await engine.upload(request(deviceA))
         try TestSupport.write(deviceA, "slot.sav", "second", modified: base.addingTimeInterval(86_400))
-        _ = try engine.upload(request(deviceA))
+        _ = try await engine.upload(request(deviceA))
 
-        let history = engine.history(request(deviceA))
-        XCTAssertEqual(history.count, 1)
-        let report = try engine.restoreHistory(request(deviceB), versionId: history[0].versionId)
+        let history = try await engine.history(request(deviceA))
+        XCTAssertEqual(history.count, 2, "every upload is a commit, so both versions are listed")
+        XCTAssertEqual(history[0].commitSHA, harness.server.headCommit)
+
+        let older = try XCTUnwrap(history.last)
+        XCTAssertNotEqual(older.contentHash, history[0].contentHash)
+
+        let report = try await engine.restoreHistory(request(deviceB), commit: older.commitSHA)
         XCTAssertEqual(report.outcome, .restoredHistory)
         XCTAssertEqual(TestSupport.contents(deviceB, "slot.sav"), "first")
     }
 
-    func testRestoreFromHistoryChecksumFailureKeepsLocal() throws {
+    func testHistoryPagingReturnsTenAtATime() async throws {
+        let base = TestSupport.date("2026-10-01T10:00:00.000Z")
+        for index in 0..<12 {
+            let stamp = base.addingTimeInterval(Double(index) * 3600)
+            try TestSupport.write(deviceA, "slot.sav", "version-\(index)", modified: stamp)
+            _ = try await engine.upload(request(deviceA))
+        }
+
+        let firstPage = try await engine.history(request(deviceA), limit: 10, page: 1)
+        XCTAssertEqual(firstPage.count, 10)
+
+        let secondPage = try await engine.history(request(deviceA), limit: 10, page: 2)
+        XCTAssertEqual(secondPage.count, 2)
+        XCTAssertTrue(Set(firstPage.map(\.commitSHA)).isDisjoint(with: Set(secondPage.map(\.commitSHA))))
+    }
+
+    func testRestoreFromHistoryChecksumFailureKeepsLocal() async throws {
         let base = TestSupport.date("2026-10-01T10:00:00.000Z")
         try TestSupport.write(deviceA, "slot.sav", "first", modified: base)
-        _ = try engine.upload(request(deviceA))
+        _ = try await engine.upload(request(deviceA))
         try TestSupport.write(deviceA, "slot.sav", "second", modified: base.addingTimeInterval(86_400))
-        _ = try engine.upload(request(deviceA))
+        _ = try await engine.upload(request(deviceA))
 
-        let history = engine.history(request(deviceA))
-        let zip = cloud.appendingPathComponent(gameId).appendingPathComponent("history")
-            .appendingPathComponent("\(history[0].versionId).zip")
-        var data = try Data(contentsOf: zip)
-        // Flip a byte inside the stored payload so the CRC check fails.
-        let payload = data.range(of: Data("first".utf8))
-        XCTAssertNotNil(payload)
-        if let index = payload?.lowerBound {
-            data[index] = 0x46 // 'F'
-        }
-        try data.write(to: zip)
+        let history = try await engine.history(request(deviceA))
+        let older = try XCTUnwrap(history.last)
 
         try TestSupport.write(deviceB, "slot.sav", "local", modified: base)
-        XCTAssertThrowsError(try engine.restoreHistory(request(deviceB), versionId: history[0].versionId))
+        harness.server.corruptArchiveDownloads = true
+
+        do {
+            _ = try await engine.restoreHistory(request(deviceB), commit: older.commitSHA)
+            XCTFail("a corrupted historical archive must not be applied")
+        } catch {
+            XCTAssertEqual(error as? SyncError, .cloudVerificationFailed)
+        }
         XCTAssertEqual(TestSupport.contents(deviceB, "slot.sav"), "local",
                        "a failed verification must leave the local folder untouched")
     }
 
-    func testUnicodeAndEmptyDirectoriesRoundTrip() throws {
+    func testUnicodeAndEmptyDirectoriesRoundTrip() async throws {
         let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
         try TestSupport.write(deviceA, "存档/角色 一.sav", "数据", modified: stamp)
         try TestSupport.makeDirectory(deviceA.appendingPathComponent("空目录"))
 
-        _ = try engine.upload(request(deviceA))
-        _ = try engine.restore(request(deviceB))
+        _ = try await engine.upload(request(deviceA))
+        _ = try await engine.restore(request(deviceB))
 
         XCTAssertEqual(TestSupport.contents(deviceB, "存档/角色 一.sav"), "数据")
         XCTAssertTrue(FileSystem.isDirectory(deviceB.appendingPathComponent("空目录")),

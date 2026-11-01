@@ -59,8 +59,6 @@ public struct CloudManifest: Codable, Hashable, Sendable {
     public var archiveBytes: Int
     public var archiveSHA256: String
     public var status: Status
-    /// Best-effort iCloud upload confirmation recorded after the write completed.
-    public var iCloudUploaded: Bool?
 
     public init(schema: Int = CloudManifest.schemaVersion,
                 gameId: String,
@@ -74,11 +72,10 @@ public struct CloudManifest: Codable, Hashable, Sendable {
                 contentHash: String,
                 fileCount: Int,
                 totalBytes: Int64,
-                archiveFileName: String = "latest.zip",
+                archiveFileName: String = GitHubLayout.archiveFileName,
                 archiveBytes: Int,
                 archiveSHA256: String,
-                status: Status = .complete,
-                iCloudUploaded: Bool? = nil) {
+                status: Status = .complete) {
         self.schema = schema
         self.gameId = gameId
         self.gameName = gameName
@@ -95,7 +92,6 @@ public struct CloudManifest: Codable, Hashable, Sendable {
         self.archiveBytes = archiveBytes
         self.archiveSHA256 = archiveSHA256
         self.status = status
-        self.iCloudUploaded = iCloudUploaded
     }
 
     public var snapshot: SaveSnapshot {
@@ -107,9 +103,11 @@ public struct CloudManifest: Codable, Hashable, Sendable {
     }
 }
 
-/// One entry inside `history/`.
+/// One historical version. In the GitHub layout each version is simply a commit, so the commit SHA
+/// is both the identity and the restore target.
 public struct CloudHistoryEntry: Codable, Hashable, Identifiable, Sendable {
-    public var id: String { versionId }
+    public var id: String { commitSHA }
+    public var commitSHA: String
     public var versionId: String
     public var gameName: String
     public var saveModifiedAt: Date?
@@ -119,8 +117,11 @@ public struct CloudHistoryEntry: Codable, Hashable, Identifiable, Sendable {
     public var totalBytes: Int64
     public var archiveFileName: String
     public var contentHash: String
+    /// Archive size, used to warn about large restores before anything is downloaded.
+    public var archiveBytes: Int
 
-    public init(versionId: String,
+    public init(commitSHA: String,
+                versionId: String,
                 gameName: String,
                 saveModifiedAt: Date?,
                 backupCreatedAt: Date,
@@ -128,7 +129,9 @@ public struct CloudHistoryEntry: Codable, Hashable, Identifiable, Sendable {
                 fileCount: Int,
                 totalBytes: Int64,
                 archiveFileName: String,
-                contentHash: String) {
+                contentHash: String,
+                archiveBytes: Int) {
+        self.commitSHA = commitSHA
         self.versionId = versionId
         self.gameName = gameName
         self.saveModifiedAt = saveModifiedAt
@@ -138,10 +141,12 @@ public struct CloudHistoryEntry: Codable, Hashable, Identifiable, Sendable {
         self.totalBytes = totalBytes
         self.archiveFileName = archiveFileName
         self.contentHash = contentHash
+        self.archiveBytes = archiveBytes
     }
 
-    public init(manifest: CloudManifest) {
-        self.init(versionId: manifest.versionId,
+    public init(commitSHA: String, manifest: CloudManifest) {
+        self.init(commitSHA: commitSHA,
+                  versionId: manifest.versionId,
                   gameName: manifest.gameName,
                   saveModifiedAt: manifest.saveModifiedAt,
                   backupCreatedAt: manifest.backupCreatedAt,
@@ -149,7 +154,8 @@ public struct CloudHistoryEntry: Codable, Hashable, Identifiable, Sendable {
                   fileCount: manifest.fileCount,
                   totalBytes: manifest.totalBytes,
                   archiveFileName: manifest.archiveFileName,
-                  contentHash: manifest.contentHash)
+                  contentHash: manifest.contentHash,
+                  archiveBytes: manifest.archiveBytes)
     }
 }
 

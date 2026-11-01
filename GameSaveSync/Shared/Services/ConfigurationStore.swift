@@ -11,7 +11,8 @@ public struct ConfigurationStore {
     public func loadGames() -> [Game] {
         guard let data = try? Data(contentsOf: paths.gamesFile) else { return [] }
         guard let games = try? Coders.decode([Game].self, from: data) else {
-            Log.write("games.json could not be decoded; starting empty")
+            // Never overwrite the file: a decoding problem must not destroy the user's configuration.
+            Log.write("games.json could not be decoded; starting empty without touching the file")
             return []
         }
         return games
@@ -104,10 +105,6 @@ public enum PathHint {
         #if os(iOS)
         // On iOS the absolute container path is meaningless to the user; show a readable tail.
         let components = url.pathComponents.filter { $0 != "/" }
-        if let index = components.firstIndex(of: "com~apple~CloudDocs") {
-            let tail = components[(index + 1)...].joined(separator: "/")
-            return tail.isEmpty ? "iCloud Drive" : "iCloud Drive/" + tail
-        }
         if let index = components.firstIndex(of: "Documents") {
             return components[index...].joined(separator: "/")
         }

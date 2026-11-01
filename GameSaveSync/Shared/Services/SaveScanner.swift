@@ -23,14 +23,7 @@ public struct ScanResult: Sendable {
 /// relative paths and file contents. Folder timestamps, archive timestamps and download
 /// timestamps are never used to decide which side is newer.
 public struct SaveScanner: Sendable {
-    public typealias Prepare = @Sendable (URL) throws -> Void
-
-    /// Called before a file is read, so iCloud placeholders can be materialised first.
-    public var prepare: Prepare?
-
-    public init(prepare: Prepare? = nil) {
-        self.prepare = prepare
-    }
+    public init() {}
 
     public func scan(directory: URL, computeHash: Bool = true) throws -> ScanResult {
         let fm = FileManager.default
@@ -131,9 +124,6 @@ public struct SaveScanner: Sendable {
     private func hashFiles(_ files: [ScannedFile]) throws -> String {
         var hasher = SHA256()
         for file in files.sorted(by: { $0.relativePath < $1.relativePath }) {
-            if let prepare {
-                try prepare(file.url)
-            }
             hasher.update(data: Data(file.relativePath.utf8))
             hasher.update(data: Data([0x00]))
             hasher.update(data: Data(String(file.size).utf8))

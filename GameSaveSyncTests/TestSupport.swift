@@ -51,10 +51,80 @@ enum TestSupport {
         }
         return paths.sorted()
     }
+}
 
-    static func manifest(at cloudRoot: URL, gameId: String) throws -> CloudManifest {
-        let url = cloudRoot.appendingPathComponent(gameId).appendingPathComponent("manifest.json")
-        let data = try Data(contentsOf: url)
-        return try Coders.decode(CloudManifest.self, from: data)
+/// Wires the production GitHub stack to the in-memory mock server.
+///
+/// These are the same `GitHubAPIClient` and `GitHubStorageManager` the app ships; only the
+/// transport is replaced, so the tests exercise the real request building, error mapping, commit
+/// construction and conflict handling.
+final class GitHubTestHarness {
+    let server: MockGitHubServer
+    let session: URLSession
+    let repository: GitHubRepository
+    let manager: GitHubStorageManager
+    private let apiConfiguration: GitHubAPIClient.Configuration
+
+    init(owner: String = "ohxiaoguang", name: String = "game-saves", branch: String = "main") {
+        let server = MockGitHubServer()
+        self.server = server
+        self.repository = GitHubRepository(owner: owner, name: name, branch: branch)
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockGitHubProtocol.self]
+        configuration.timeoutIntervalForRequest = 10
+        let session = URLSession(configuration: configuration)
+        self.session = session
+
+        var apiConfiguration = GitHubAPIClient.Configuration()
+        apiConfiguration.baseURL = server.baseURL
+        apiConfiguration.maximumRetries = 2
+        apiConfiguration.retryDelay = 0.01
+        self.apiConfiguration = apiConfiguration
+        self.manager = GitHubStorageManager(repository: repository,
+                                            token: MockGitHubServer.token,
+                                            session: session,
+                                            configuration: apiConfiguration)
+    }
+
+    /// A second client for the same repository, as another device would have.
+    func makeManager(branch: String? = nil) -> GitHubStorageManager {
+        GitHubStorageManager(repository: GitHubRepository(owner: repository.trimmedOwner,
+                                                          name: repository.trimmedName,
+                                                          branch: branch ?? repository.trimmedBranch),
+                             token: MockGitHubServer.token,
+                             session: session,
+                             configuration: apiConfiguration)
+    }
+
+    func makeRequest(gameId: String,
+                     gameName: String = "Test Game",
+                     localDirectory: URL,
+                     accessRoot: URL? = nil,
+                     syncRelativePath: String = "",
+                     hasSyncedBefore: Bool = true,
+                     retention: Int = 3,
+                     remote: (any RemoteStore)? = nil) -> SyncRequest {
+        SyncRequest(gameId: gameId,
+                    gameName: gameName,
+                    localDirectory: localDirectory,
+                    accessRoot: accessRoot,
+                    syncRelativePath: syncRelativePath,
+                    remote: remote ?? manager,
+                    localBackupRetention: retention,
+                    deviceName: "TestDevice",
+                    appVersion: "1.0",
+                    hasSyncedBefore: hasSyncedBefore)
+    }
+
+    /// Manifest currently on the remote branch, if any.
+    func manifest(gameId: String, branch: String? = nil) -> CloudManifest? {
+        guard let commit = server.branchHead(branch ?? repository.trimmedBranch) else { return nil }
+        return server.manifest(at: commit, gameId: gameId)
+    }
+
+    func archiveData(gameId: String, branch: String? = nil) -> Data? {
+        guard let commit = server.branchHead(branch ?? repository.trimmedBranch) else { return nil }
+        return server.archiveData(at: commit, gameId: gameId)
     }
 }

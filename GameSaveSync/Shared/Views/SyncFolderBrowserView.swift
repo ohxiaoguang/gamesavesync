@@ -303,7 +303,7 @@ private struct SubfolderRows: View {
                             .foregroundStyle(.orange)
                     }
                     .font(.callout)
-                    Text(model.l.t("iCloud or the file provider did not answer. You can try again, or choose the folder that is already authorised."))
+                    Text(model.l.t("The folder provider did not answer. You can try again, or choose the folder that is already authorised."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     retryButton
