@@ -33,6 +33,99 @@ final class SyncEngineTests: XCTestCase {
                             retention: retention)
     }
 
+    // MARK: - Empty repository
+
+    func testEmptyRepositoryFirstSyncUsesTheUploadFlow() async throws {
+        try TestSupport.write(deviceA, "slot.sav", "first", modified: TestSupport.date("2026-11-01T09:00:00.000Z"))
+        XCTAssertTrue(harness.server.repositoryIsEmpty)
+
+        let analysis = await engine.analyze(request(deviceA, hasSyncedBefore: false))
+
+        XCTAssertNil(analysis.remoteError, "a repository without commits is not an error")
+        XCTAssertNil(analysis.remote)
+        XCTAssertNil(analysis.remoteCommit)
+        XCTAssertEqual(analysis.decision, .upload(.firstSyncLocalOnly))
+        XCTAssertEqual(analysis.confirmation, .firstUpload,
+                       "the first archive of a game must be confirmed before it is uploaded")
+        XCTAssertTrue(harness.server.repositoryIsEmpty, "analysing must not write anything")
+    }
+
+    func testFirstUploadIntoAnEmptyRepositoryInitialisesAndCommitsTheSave() async throws {
+        let stamp = TestSupport.date("2026-11-01T09:00:00.000Z")
+        try TestSupport.write(deviceA, "slot.sav", "first", modified: stamp)
+        try TestSupport.write(deviceA, "profile/opts.ini", "x", modified: stamp.addingTimeInterval(-30))
+
+        let report = try await engine.perform(request(deviceA, hasSyncedBefore: false), direction: .upload)
+
+        XCTAssertEqual(report.outcome, .uploaded)
+        let head = try XCTUnwrap(harness.server.headCommit)
+        XCTAssertEqual(report.commitSHA, head)
+        XCTAssertNotNil(harness.server.fileContents(at: head, path: GitHubLayout.initialisationPath),
+                        "an empty repository must be initialised through the contents endpoint")
+
+        let manifest = try XCTUnwrap(harness.manifest(gameId: gameId))
+        XCTAssertEqual(manifest.fileCount, 2)
+        XCTAssertNotNil(harness.server.archiveData(at: head, gameId: gameId),
+                        "the archive must sit in the same commit as its manifest")
+
+        // HEAD is readable as soon as the repository has a commit.
+        let after = try await harness.manager.head()
+        XCTAssertEqual(after.commit, head)
+
+        // And the next sync recognises the archive it just uploaded.
+        let analysis = await engine.analyze(request(deviceA))
+        XCTAssertNil(analysis.remoteError)
+        XCTAssertEqual(analysis.remote?.contentHash, manifest.contentHash)
+        XCTAssertEqual(analysis.decision, .upToDate)
+    }
+
+    func testEmptyRepositorySyncInitialisesOnlyOnce() async throws {
+        try TestSupport.write(deviceA, "slot.sav", "first", modified: TestSupport.date("2026-11-01T09:00:00.000Z"))
+        _ = try await engine.perform(request(deviceA, hasSyncedBefore: false), direction: .upload)
+
+        try TestSupport.write(deviceA, "slot.sav", "second", modified: TestSupport.date("2026-11-02T09:00:00.000Z"))
+        let second = try await engine.perform(request(deviceA), direction: .upload)
+
+        XCTAssertEqual(second.outcome, .uploaded)
+        let initialisations = harness.server.statusLog.filter {
+            $0.hasPrefix("PUT ") && $0.contains("/contents/") && $0.hasSuffix(" 201")
+        }
+        XCTAssertEqual(initialisations.count, 1, "the repository must be initialised exactly once")
+        XCTAssertEqual(harness.manifest(gameId: gameId)?.fileCount, 1)
+    }
+
+    func testRepositoryWithCommitsAndMissingBranchIsNotInitialised() async throws {
+        harness.server.seedRepository()
+        try TestSupport.write(deviceA, "slot.sav", "first", modified: TestSupport.date("2026-11-01T09:00:00.000Z"))
+        let manager = harness.makeManager(branch: "archives")
+        let custom = harness.makeRequest(gameId: gameId,
+                                        localDirectory: deviceA,
+                                        hasSyncedBefore: false,
+                                        remote: manager)
+
+        let analysis = await engine.analyze(custom)
+
+        XCTAssertEqual(analysis.decision, .blocked(.gitHubBranchMissing("archives")))
+        XCTAssertFalse(harness.server.statusLog.contains { $0.hasPrefix("PUT ") && $0.contains("/contents/") },
+                       "a repository that already has commits must never be re-initialised")
+        XCTAssertNil(harness.server.branchHead("archives"))
+    }
+
+    func testPermissionFailureIsNotTreatedAsAnEmptyRepository() async throws {
+        try TestSupport.write(deviceA, "slot.sav", "first", modified: TestSupport.date("2026-11-01T09:00:00.000Z"))
+        harness.server.persistentFault = .status(403, "Resource not accessible by personal access token")
+
+        let analysis = await engine.analyze(request(deviceA, hasSyncedBefore: false))
+
+        guard case .blocked(let error) = analysis.decision else {
+            return XCTFail("a permission failure must block the sync, got \(analysis.decision)")
+        }
+        guard case .gitHubPermissionDenied = error else {
+            return XCTFail("expected gitHubPermissionDenied, got \(error)")
+        }
+        XCTAssertFalse(harness.server.statusLog.contains { $0.hasPrefix("PUT ") })
+    }
+
     // MARK: - Upload
 
     func testFirstUploadCreatesACommitWithManifestAndArchive() async throws {

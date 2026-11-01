@@ -33,7 +33,7 @@
 | Swift | 6.4（工程使用 Swift 5 语言模式 + `SWIFT_STRICT_CONCURRENCY=minimal`） |
 | 部署目标 | iOS 17.0 / macOS 14.0 |
 | 构建产物 | macOS 通用二进制（arm64 + x86_64，ad-hoc 签名 + App Sandbox）；iOS arm64 `.app` → 未签名 IPA |
-| 单元测试 | 110 个，全部通过（macOS 逻辑测试，GitHub 接口用 `URLProtocol` 模拟） |
+| 单元测试 | 118 个，全部通过（macOS 逻辑测试，GitHub 接口用 `URLProtocol` 模拟） |
 | UI 测试 | 11 个，全部通过（iPhone 模拟器） |
 
 ---
@@ -356,7 +356,7 @@ ZIP 内部额外带一个 `.gamesavesync-archive.json` 旁路文件，记录每�
 ## 12. 测试
 
 ```bash
-# 单元测试（macOS，110 个）
+# 单元测试（macOS，118 个）
 xcodebuild test -project GameSaveSync.xcodeproj -scheme GameSaveSync-macOS -destination 'platform=macOS'
 
 # UI / 端到端测试（iOS 模拟器，11 个；把设备名换成你本机任意一台 iPhone 模拟器）
@@ -371,7 +371,12 @@ GitHub 相关的单元测试把生产代码（`GitHubAPIClient` + `GitHubStorage
 | 用例 | 关注点 |
 | --- | --- |
 | `testTokenNeverLandsInSettings` / `testKeychainStorePersistsAndDeletes` | 令牌只在 Keychain，`settings.json` 里没有 |
-| `testEmptyRepositoryReportsNoCommit` / `testEmptyRepositoryIsInitialisedBeforeTheFirstSaveCommit` | 空仓库用内容接口初始化，不依赖 `POST /git/refs` |
+| `testEmptyRepositoryReportsNoCommit` / `testEmptyRepositoryRefAnswers409AndIsNotAnError` | 空仓库的 ref 返回 409 时视为「还没有提交」，不是错误 |
+| `testEmptyRepositoryIsInitialisedBeforeTheFirstSaveCommit` | 空仓库用内容接口初始化，不依赖 `POST /git/refs` |
+| `testEmptyRepositoryFirstSyncUsesTheUploadFlow` / `testFirstUploadIntoAnEmptyRepositoryInitialisesAndCommitsTheSave` | 从 `analyze()` 到 `upload()` 的完整首次上传：确认 → 初始化 → 提交 → 再同步识别已有存档 |
+| `testEmptyRepositorySyncInitialisesOnlyOnce` | 初始化只发生一次，第二次上传直接快进提交 |
+| `testRepositoryWithCommitsAndMissingBranchIsNotInitialised` | 仓库已有提交、目标分支不存在 → 提示建分支，绝不初始化 |
+| `testPermissionFailureIsNotTreatedAsAnEmptyRepository` | 403 权限错误不会被误判成空仓库 |
 | `testInitialUploadLeavesExistingRepositoryFilesAlone` | 已有 README 等的仓库首次上传不被改动，也不会重复初始化 |
 | `testConfiguredBranchIsCreatedWhenItIsNotTheDefaultBranch` | 填写的分支不是默认分支时，在初始提交上创建该分支 |
 | `testTwoDevicesCanInitialiseTheSameEmptyRepository` | 两台设备同时面对空仓库都能成功，互不丢版本 |
@@ -382,6 +387,7 @@ GitHub 相关的单元测试把生产代码（`GitHubAPIClient` + `GitHubStorage
 | `testManifestAndArchiveLiveInTheSameCommit` | 清单与压缩包在同一 commit，且旧 commit 保持旧内容 |
 | `testSecondUploadKeepsOtherGamesIntact` / `testUnrelatedCommitIsRebasedInsteadOfFailing` | 其它游戏与其它设备提交不被破坏 |
 | `testConcurrentUploadOfTheSameGameIsNeverOverwritten` / `testForcedUploadAbortsWhenTheSameGameChangedAfterAnalysis` | 同一游戏并发写入 → 中止（含强制上传），别人版本保留 |
+| `testRefConflictOnBranchUpdateIsReportedAsAConflict` | `PATCH /git/refs` 返回 409 → 按提交冲突处理，分支不动 |
 | `testUncertainTimeoutDoesNotCreateASecondCommit` | 超时后先查远端，不产生重复 commit |
 | `testDownloadUsesTheRequestedCommit` / `testDownloadRejectsAnArchiveThatDoesNotMatchItsManifest` | 按指定 commit 读取、校验失败即拒绝 |
 | `testRestoreCopiesFilesAndPreservesModificationTimes` | 恢复后文件内容与修改时间保持（误差 < 50 ms） |
@@ -420,7 +426,7 @@ GitHub 相关的单元测试把生产代码（`GitHubAPIClient` + `GitHubStorage
 **已在模拟器与桌面上验证**
 
 - macOS 与 iOS 两端都能编译通过（Debug / Release）。
-- 110 个单元测试、11 个 UI 测试全部通过。
+- 118 个单元测试、11 个 UI 测试全部通过。
 - macOS App 可启动、可添加配置、可同步（用内置演示远端跑通整条链路）。
 - iOS 模拟器上：列表/详情/冲突弹窗/确认弹窗/真实同步执行（端到端 UI 测试）。
 

@@ -51,38 +51,62 @@ public final class GitHubAPIClient: @unchecked Sendable {
     }
 
     /// HEAD of the configured branch. `nil` means the repository has no commit at all yet.
+    ///
+    /// A missing ref is reported as **404** ("Not Found") when the branch does not exist and as
+    /// **409** ("Git Repository is empty.") when the repository has no commit at all. Neither
+    /// status may be trusted on its own — a proxy, an expired token or a repository that is still
+    /// being created can produce them too — so both are resolved against the repository itself
+    /// before anything is concluded.
     public func headCommit(_ repo: GitHubRepository) async throws -> String? {
         let path = "/repos/\(repo.trimmedOwner)/\(repo.trimmedName)/git/ref/heads/\(escape(repo.trimmedBranch))"
         let response = try await send(request(for: [], path: path), allowsRetry: true)
-        if response.status == 404 {
-            return try await resolveMissingBranch(repo)
+        switch response.status {
+        case 200..<300:
+            let ref = try decode(GHRefResponse.self, from: response, context: .branch(repo.trimmedBranch))
+            return ref.object.sha
+        case 404, 409:
+            return try await resolveMissingReference(repo, refStatus: response.status)
+        default:
+            throw try mapError(response, context: .branch(repo.trimmedBranch))
         }
-        let ref = try decode(GHRefResponse.self, from: response, context: .resource("ref"))
-        return ref.object.sha
     }
 
-    /// A 404 on the ref is either "empty repository" or "the branch does not exist".
-    private func resolveMissingBranch(_ repo: GitHubRepository) async throws -> String? {
-        let path = "/repos/\(repo.trimmedOwner)/\(repo.trimmedName)/commits"
+    /// Answers "is this branch missing, or is the whole repository empty?" after a failed ref read.
+    private func resolveMissingReference(_ repo: GitHubRepository, refStatus: Int) async throws -> String? {
+        // 1. The repository itself must be readable. A 401/403/404 here is the real story and is
+        //    reported as such instead of being disguised as "the repository is empty".
+        let info = try await repository(repo)
+
+        // 2. Ask the configured branch for one commit. An empty repository answers 409 again, a
+        //    repository with commits answers 422 for a branch it does not have.
         let query = [
             URLQueryItem(name: "sha", value: repo.trimmedBranch),
             URLQueryItem(name: "per_page", value: "1")
         ]
-        let response = try await send(request(for: query, path: path), allowsRetry: true)
-        switch response.status {
+        let path = "/repos/\(repo.trimmedOwner)/\(repo.trimmedName)/commits"
+        let probe = try await send(request(for: query, path: path), allowsRetry: true)
+
+        switch probe.status {
         case 200:
-            let items = (try? JSONDecoder().decode([GHCommitListItem].self, from: response.body)) ?? []
-            if items.isEmpty { return nil }
-            // Commits exist for this branch but the ref endpoint did not answer: treat it as a
-            // missing branch rather than silently creating a second history.
-            throw SyncError.gitHubBranchMissing(repo.trimmedBranch)
-        case 404, 422:
-            // 422 is what the endpoint answers for a SHA that is not a branch in this repository.
-            throw SyncError.gitHubBranchMissing(repo.trimmedBranch)
-        case 409:
+            let items = (try? JSONDecoder().decode([GHCommitListItem].self, from: probe.body)) ?? []
+            if let head = items.first {
+                // The requested branch resolved, so this really is its head: the ref lookup was
+                // the odd one out. Using it keeps a transient ref failure from starting a second
+                // history for the same branch.
+                Log.write("[GitHub] ref read answered \(refStatus) but branch \(repo.trimmedBranch) has commits; using its head")
+                return head.sha
+            }
+            // No commits at all: the repository is genuinely empty, which is not an error.
+            Log.write("[GitHub] repository \(repo.fullName) has no commit yet")
             return nil
+        case 409:
+            Log.write("[GitHub] repository \(repo.fullName) is empty (409 from commits)")
+            return nil
+        case 404, 422:
+            Log.write("[GitHub] branch \(repo.trimmedBranch) does not exist in \(repo.fullName) (default branch: \(info.defaultBranch ?? "-"))")
+            throw SyncError.gitHubBranchMissing(repo.trimmedBranch)
         default:
-            throw try mapError(response, context: .branch(repo.trimmedBranch))
+            throw try mapError(probe, context: .branch(repo.trimmedBranch))
         }
     }
 
@@ -331,6 +355,7 @@ public final class GitHubAPIClient: @unchecked Sendable {
                 let mapped = GitHubHTTPResponse(status: http.statusCode,
                                                 headers: headerDictionary(http),
                                                 body: data)
+                Self.trace(request, status: mapped.status)
                 if allowsRetry, shouldRetry(status: mapped.status, attempt: attempt) {
                     attempt += 1
                     try await backoff(attempt: attempt, response: mapped)
@@ -338,9 +363,11 @@ public final class GitHubAPIClient: @unchecked Sendable {
                 }
                 return mapped
             } catch let error as SyncError {
+                Self.trace(request, error: error)
                 throw error
             } catch {
                 let syncError = Self.mapTransportError(error)
+                Self.trace(request, error: syncError)
                 if allowsRetry, case .networkUnavailable = syncError, attempt < configuration.maximumRetries {
                     attempt += 1
                     try await backoff(attempt: attempt, response: nil)
@@ -360,6 +387,7 @@ public final class GitHubAPIClient: @unchecked Sendable {
                     try? FileManager.default.removeItem(at: url)
                     throw SyncError.networkUnavailable
                 }
+                Self.trace(request, status: http.statusCode)
                 if allowsRetry, shouldRetry(status: http.statusCode, attempt: attempt) {
                     try? FileManager.default.removeItem(at: url)
                     attempt += 1
@@ -371,9 +399,11 @@ public final class GitHubAPIClient: @unchecked Sendable {
                 }
                 return (url, response)
             } catch let error as SyncError {
+                Self.trace(request, error: error)
                 throw error
             } catch {
                 let syncError = Self.mapTransportError(error)
+                Self.trace(request, error: syncError)
                 if allowsRetry, case .networkUnavailable = syncError, attempt < configuration.maximumRetries {
                     attempt += 1
                     try await backoff(attempt: attempt, response: nil)
@@ -390,11 +420,15 @@ public final class GitHubAPIClient: @unchecked Sendable {
         do {
             let (data, response) = try await session.upload(for: request, fromFile: bodyFile)
             guard let http = response as? HTTPURLResponse else { throw SyncError.networkUnavailable }
+            Self.trace(request, status: http.statusCode)
             return (data, http)
         } catch let error as SyncError {
+            Self.trace(request, error: error)
             throw error
         } catch {
-            throw Self.mapTransportError(error)
+            let syncError = Self.mapTransportError(error)
+            Self.trace(request, error: syncError)
+            throw syncError
         }
     }
 
@@ -458,10 +492,17 @@ public final class GitHubAPIClient: @unchecked Sendable {
                 return .gitHubNotFound(name)
             }
         case 409:
-            // A conflict on a ref means another writer moved the branch; anywhere else it is the
-            // "repository has no git database yet" answer.
-            if case .branch = context { return .gitHubRemoteChanged }
-            return .gitHubRepositoryEmpty
+            // 409 does not mean the same thing everywhere: on a branch write it is a competing
+            // writer, on a repository read it is not "empty", and only the git object endpoints
+            // answer it while the repository still has no commit.
+            switch context {
+            case .branch:
+                return .gitHubRemoteChanged
+            case .repository:
+                return .gitHubUnexpectedResponse(message ?? "HTTP 409")
+            case .resource:
+                return .gitHubRepositoryEmpty
+            }
         case 422:
             return .gitHubUnprocessable
         case 429:
@@ -490,6 +531,26 @@ public final class GitHubAPIClient: @unchecked Sendable {
             result[key.lowercased()] = String(describing: value)
         }
         return result
+    }
+
+    // MARK: - Diagnostics
+
+    /// Logs the request line and status only: never the token, the body or a token-bearing URL.
+    private static func trace(_ request: URLRequest, status: Int) {
+        Log.write("[GitHub] \(method(of: request)) \(path(of: request)) → HTTP \(status)")
+    }
+
+    private static func trace(_ request: URLRequest, error: SyncError) {
+        Log.write("[GitHub] \(method(of: request)) \(path(of: request)) → \(diagnosticName(of: error))")
+    }
+
+    private static func method(of request: URLRequest) -> String { request.httpMethod ?? "GET" }
+
+    private static func path(of request: URLRequest) -> String { request.url?.path ?? "-" }
+
+    /// Case name without its payload, for logs that must stay free of server messages.
+    static func diagnosticName(of error: SyncError) -> String {
+        String(String(describing: error).prefix(while: { $0 != "(" }))
     }
 
     static func mapTransportError(_ error: Error) -> SyncError {

@@ -47,6 +47,9 @@ final class MockGitHubServer: @unchecked Sendable {
     private(set) var refs: [String: String] = [:]
     private(set) var commitLog: [String] = []
     private(set) var requestLog: [String] = []
+    /// "METHOD path status" for every answered request, so a test can assert which status the
+    /// stand-in really produced (a 409 ref on an empty repository, for example).
+    private(set) var statusLog: [String] = []
 
     /// Applied to the next request(s) in order.
     var faults: [Fault] = []
@@ -54,6 +57,8 @@ final class MockGitHubServer: @unchecked Sendable {
     var persistentFault: Fault?
     /// Applies a branch update and then fails the transport, as a dropped connection would.
     var failRefUpdateAfterApplying = false
+    /// Answers every `PATCH /git/refs` with this fault before touching the branch.
+    var refUpdateFault: Fault?
     /// Runs once, right before a branch update is processed. Lets a test simulate another device.
     var beforeRefUpdate: ((MockGitHubServer) -> Void)?
     /// When true, archive blob reads answer with corrupted bytes. Manifests are left intact so a
@@ -119,6 +124,12 @@ final class MockGitHubServer: @unchecked Sendable {
     var repositoryIsEmpty: Bool {
         lock.lock(); defer { lock.unlock() }
         return refs.isEmpty
+    }
+
+    /// Called by `MockGitHubProtocol` so tests can assert the status a request really received.
+    func record(method: String, path: String, status: Int) {
+        lock.lock(); defer { lock.unlock() }
+        statusLog.append("\(method) \(path) \(status)")
     }
 
     /// Puts the repository in the state a user's own repository is normally in: one commit on a
@@ -296,6 +307,10 @@ final class MockGitHubServer: @unchecked Sendable {
         case ("ref", "GET"):
             // /git/ref/heads/<branch>
             let branch = (tail.first == "heads" ? Array(tail.dropFirst()) : tail).joined(separator: "/")
+            // GitHub answers 409 ("Git Repository is empty.") while the repository has no branch
+            // at all, and 404 for a branch it does not have. Keeping both answers distinct is what
+            // lets the app tell "set the repository up" from "create that branch".
+            guard !refs.isEmpty else { return error(409, "Git Repository is empty.") }
             guard let sha = refs[branch] else { return error(404, "Not Found") }
             return json(["ref": "refs/heads/\(branch)",
                          "object": ["sha": sha, "type": "commit"]])
@@ -315,6 +330,7 @@ final class MockGitHubServer: @unchecked Sendable {
 
         case ("refs", "PATCH"):
             // /git/refs/heads/<branch>
+            if let fault = refUpdateFault { return response(for: fault) }
             let branch = (tail.first == "heads" ? Array(tail.dropFirst()) : tail).joined(separator: "/")
             guard let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
                   let sha = payload["sha"] as? String else {
@@ -439,13 +455,18 @@ final class MockGitHubServer: @unchecked Sendable {
                     status: 201)
     }
 
-    private func handleCommitList(query: [URLQueryItem]) -> Response {        let path = query.first { $0.name == "path" }?.value
+    private func handleCommitList(query: [URLQueryItem]) -> Response {
+        let path = query.first { $0.name == "path" }?.value
         let branch = query.first { $0.name == "sha" }?.value ?? defaultBranch
         let perPage = Int(query.first { $0.name == "per_page" }?.value ?? "30") ?? 30
         let page = Int(query.first { $0.name == "page" }?.value ?? "1") ?? 1
 
         guard let head = refs[branch] else {
-            return refs.isEmpty ? error(409, "Git Repository is empty.") : error(404, "Not Found")
+            // No branches at all: the repository has no commit. A repository that does have
+            // commits answers 422 for a branch it does not have, exactly like GitHub does for an
+            // unknown SHA.
+            if refs.isEmpty { return error(409, "Git Repository is empty.") }
+            return error(422, "No commit found for SHA: \(branch)")
         }
 
         var chain: [Commit] = []
@@ -544,6 +565,7 @@ final class MockGitHubProtocol: URLProtocol {
                                      query: query,
                                      headers: headers,
                                      body: body)
+        server.record(method: request.httpMethod ?? "GET", path: path, status: response.status)
 
         if response.status == -1, let raw = response.headers["x-url-error"], let code = Int(raw) {
             client?.urlProtocol(self, didFailWithError: URLError(URLError.Code(rawValue: code)))

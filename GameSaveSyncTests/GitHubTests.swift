@@ -84,6 +84,29 @@ final class GitHubConnectionTests: XCTestCase {
         XCTAssertEqual(report.account, "ohxiaoguang")
     }
 
+    func testEmptyRepositoryRefAnswers409AndIsNotAnError() async throws {
+        // GitHub answers 409 ("Git Repository is empty.") for the ref of a repository that has no
+        // commit yet, not 404. Reading HEAD must turn that into "no commit", never into a failure.
+        let head = try await harness.manager.head()
+        XCTAssertNil(head.commit)
+
+        XCTAssertTrue(harness.server.statusLog.contains {
+            $0.hasPrefix("GET ") && $0.contains("/git/ref/heads/main") && $0.hasSuffix(" 409")
+        }, "the stand-in must reproduce GitHub's 409, otherwise this case is never exercised")
+
+        XCTAssertFalse(harness.server.statusLog.contains { $0.hasPrefix("PUT ") },
+                       "reading HEAD must never write anything")
+    }
+
+    func testEmptyRepositoryIsNotMistakenForAMissingBranch() async throws {
+        // The probe behind the 409 must say "empty repository", not "create the branch".
+        _ = try await harness.manager.head()
+        XCTAssertTrue(harness.server.repositoryIsEmpty)
+        let probe = harness.server.statusLog.filter { $0.hasPrefix("GET ") && $0.contains("/commits") }
+        XCTAssertFalse(probe.isEmpty, "the ref answer must be confirmed against the repository")
+        XCTAssertEqual(probe.last?.hasSuffix(" 409"), true)
+    }
+
     func testConnectionRejectsPublicRepository() async {
         harness.server.isPrivate = false
         do {
@@ -424,6 +447,24 @@ final class GitHubUploadTests: XCTestCase {
             XCTAssertEqual(limit, 100 << 20)
         }
         XCTAssertTrue(harness.server.requestLog.isEmpty, "the size must be checked before uploading")
+    }
+
+    func testRefConflictOnBranchUpdateIsReportedAsAConflict() async throws {
+        harness.server.seedRepository()
+        let base = try XCTUnwrap(harness.server.headCommit)
+        // A 409 on a branch write means "someone else moved the branch", not "empty repository".
+        harness.server.refUpdateFault = .status(409, "Conflict")
+
+        do {
+            _ = try await harness.manager.upload(manifest: manifest("h1"),
+                                                 archive: try archive("abc"),
+                                                 precondition: UploadPrecondition(baseCommit: base, remoteContentHash: nil),
+                                                 progress: nil)
+            XCTFail("a conflicting ref update must not be reported as success")
+        } catch {
+            XCTAssertEqual(error as? SyncError, .gitHubRemoteChanged)
+        }
+        XCTAssertEqual(harness.server.headCommit, base, "the branch must not move")
     }
 
     func testLostConnectionDuringUploadCreatesNoCommit() async throws {

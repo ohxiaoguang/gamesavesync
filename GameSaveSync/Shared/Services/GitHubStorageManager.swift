@@ -63,7 +63,13 @@ public struct GitHubStorageManager: RemoteStore {
     }
 
     public func head() async throws -> RemoteHead {
-        RemoteHead(commit: try await api.headCommit(repository))
+        do {
+            return RemoteHead(commit: try await api.headCommit(repository))
+        } catch SyncError.gitHubRepositoryEmpty {
+            // "No commit yet" is a state, not a failure: the caller decides whether to initialise.
+            Log.write("[GitHub] \(repository.fullName) reports an empty repository; HEAD is nil")
+            return RemoteHead(commit: nil)
+        }
     }
 
     // MARK: - Reading
@@ -176,11 +182,14 @@ public struct GitHubStorageManager: RemoteStore {
                 // is created through the contents endpoint; the upload then continues on top of it.
                 guard !initialized else { throw SyncError.gitHubBranchMissing(repository.trimmedBranch) }
                 initialized = true
+                Log.write("[GitHub] \(repository.fullName) has no commit; initialising before the first upload")
                 do {
                     try await initializeRepository()
                 } catch SyncError.gitHubUnprocessable, SyncError.gitHubRemoteChanged {
                     // Another device initialised the repository first; re-read it below.
+                    Log.write("[GitHub] initialisation was already done by someone else; re-reading HEAD")
                 }
+                Log.write("[GitHub] HEAD after initialisation: \(await describeHead())")
                 continue
             }
 
@@ -205,6 +214,7 @@ public struct GitHubStorageManager: RemoteStore {
                                                     parentCommit: headCommit,
                                                     progress: progress)
                 try await api.updateRef(repository, commit: commit)
+                Log.write("[GitHub] committed \(commit.prefix(7)) for \(manifest.gameId) on \(repository.trimmedBranch)")
                 return UploadResult(commit: commit, unchanged: false)
             } catch SyncError.gitHubRemoteChanged where attempt < Self.maximumCommitAttempts {
                 // Only another game (or another branch writer) moved: rebuild on the new head.
@@ -236,6 +246,12 @@ public struct GitHubStorageManager: RemoteStore {
         }
         guard existing == nil else { return }
         try await api.createRef(repository, commit: commit)
+    }
+
+    /// Diagnostic description of the branch after initialisation; never throws.
+    private func describeHead() async -> String {
+        guard let head = try? await head(), let commit = head.commit else { return "unavailable" }
+        return String(commit.prefix(7))
     }
 
     /// Builds the blobs, tree and commit, but does not move the branch.

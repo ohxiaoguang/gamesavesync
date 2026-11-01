@@ -180,8 +180,10 @@ public struct SyncEngine: Sendable {
             }
         } catch let error as SyncError {
             remoteError = error
+            Log.write("[Sync] \(request.gameId) remote read failed: \(GitHubAPIClient.diagnosticName(of: error))")
         } catch {
             remoteError = .networkUnavailable
+            Log.write("[Sync] \(request.gameId) remote read failed: networkUnavailable")
         }
 
         var local: SaveSnapshot?
@@ -217,6 +219,8 @@ public struct SyncEngine: Sendable {
         } else {
             decision = SyncDecisionMaker.decide(local: local, remote: remoteManifest)
         }
+
+        Log.write("[Sync] \(request.gameId) → \(decision); remote commit \(remoteCommit.map { String($0.prefix(7)) } ?? "none"); remote save \(remoteManifest == nil ? "absent" : "present")")
 
         let confirmation = SyncDecisionMaker.confirmation(for: decision,
                                                           local: local,
