@@ -49,7 +49,7 @@ public enum ArchiveManager {
 
         let sortedDirectories = scan.directories.sorted()
         for directory in sortedDirectories {
-            entries.append(ZipEntrySource(path: directory + "/",
+            entries.append(ZipEntrySource(path: ArchivePath.encode(directory) + "/",
                                           modificationDate: saveModifiedAt ?? Date(),
                                           isDirectory: true))
         }
@@ -61,7 +61,9 @@ public enum ArchiveManager {
             } catch {
                 throw SyncError.generic("Could not read \(file.relativePath): \(error.localizedDescription)")
             }
-            entries.append(ZipEntrySource(path: file.relativePath,
+            // The entry name is escaped so the archive stays free of backslashes; the sidecar below
+            // keeps the real name, which is what the restore puts back on disk.
+            entries.append(ZipEntrySource(path: ArchivePath.encode(file.relativePath),
                                           data: data,
                                           modificationDate: file.modified))
             fileRecords.append(Metadata.FileRecord(path: file.relativePath,
@@ -85,7 +87,7 @@ public enum ArchiveManager {
                                       modificationDate: Date()))
 
         try? FileManager.default.removeItem(at: zipURL)
-        try ZipWriter.write(entries: entries, to: zipURL)
+        try ZipWriter.write(entries: entries, to: zipURL, comment: ZipMarker.escapedPaths)
         Log.write("archive \(zipURL.lastPathComponent) game=\(gameId) files=\(fileRecords.count) bytes=\(scan.snapshot.totalBytes)")
         return metadata
     }

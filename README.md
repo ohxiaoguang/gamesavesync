@@ -33,7 +33,7 @@
 | Swift | 6.4（工程使用 Swift 5 语言模式 + `SWIFT_STRICT_CONCURRENCY=minimal`） |
 | 部署目标 | iOS 17.0 / macOS 14.0 |
 | 构建产物 | macOS 通用二进制（arm64 + x86_64，ad-hoc 签名 + App Sandbox）；iOS arm64 `.app` → 未签名 IPA |
-| 单元测试 | 118 个，全部通过（macOS 逻辑测试，GitHub 接口用 `URLProtocol` 模拟） |
+| 单元测试 | 137 个，全部通过（macOS 逻辑测试，GitHub 接口用 `URLProtocol` 模拟） |
 | UI 测试 | 11 个，全部通过（iPhone 模拟器） |
 
 ---
@@ -253,6 +253,10 @@ App 会在这个初始提交上创建该分支。仓库里已有的 README 等�
 
 ZIP 内部额外带一个 `.gamesavesync-archive.json` 旁路文件，记录每个文件的精确修改时间（ZIP 的 DOS 时间只有 2 秒精度且无时区），解压后据此还原时间戳，然后删除该文件。
 
+存档目录里的文件名会被原样还原，包括反斜杠。macOS/iOS 的文件系统允许 `\` 出现在文件名里（Windows 游戏常写出 `\savedata0.bin` 这样的文件），而部分解压工具会把 `\` 当成目录分隔符，所以 ZIP 条目名里的 `\` 存成 `%5C`、`%` 存成 `%25`，解压时再转回原始文件名。其它字符（包括 `100% done.sav` 里单独出现的 `%`）保持原样；条目名本身仍然不允许出现反斜杠，路径校验不因此放宽。
+
+编码版本写在 ZIP 结尾记录的注释字段里（`GameSaveSync path encoding 2`），读归档时只认这个标记，不靠文件名里有没有 `%5C` 去猜：没有标记的旧归档按原样解压，名字里本来就有 `%5C`、`%25` 的文件不会被改写；带标记的新归档才会把 `%5C`、`%25` 还原成反斜杠和百分号。
+
 ---
 
 ## 8. 同步判定规则
@@ -356,7 +360,7 @@ ZIP 内部额外带一个 `.gamesavesync-archive.json` 旁路文件，记录每�
 ## 12. 测试
 
 ```bash
-# 单元测试（macOS，118 个）
+# 单元测试（macOS，137 个）
 xcodebuild test -project GameSaveSync.xcodeproj -scheme GameSaveSync-macOS -destination 'platform=macOS'
 
 # UI / 端到端测试（iOS 模拟器，11 个；把设备名换成你本机任意一台 iPhone 模拟器）
@@ -406,6 +410,12 @@ GitHub 相关的单元测试把生产代码（`GitHubAPIClient` + `GitHubStorage
 | `testHistoryPagingReturnsTenAtATime` | 历史分页 10 条 |
 | `testRestoreFromHistoryChecksumFailureKeepsLocal` | 历史包损坏 → 本地不变 |
 | `testUnicodeAndEmptyDirectoriesRoundTrip` | 中文文件名、空目录往返 |
+| `testLeadingBackslashFileNameSurvivesTheRoundTrip` / `testBackslashInsideAFileNameSurvivesTheRoundTrip` | 文件名含 `\` 时打包 → 解压 → 校验全部通过，名字不变 |
+| `testPercentIsNotMistakenForAnEscape` / `testCodecIsReversibleForEveryCombination` | `%` 与 `%5C` 的转义可逆，普通 `%` 不被误读 |
+| `testRawBackslashEntriesFromForeignArchivesAreStillRejected` / `testEscapedNameStillCannotEscapeTheDestination` | 条目名里的反斜杠、`..\` 仍然被拒绝 |
+| `testArchiveVersionComesFromTheMarkerNotFromTheNames` / `testLegacyArchiveKeepsPercentSequencesInFileNames` | 编码版本只认归档标记；旧归档里本来就叫 `%5C`、`%25` 的文件不会被改写 |
+| `testNewArchiveRestoresPercentSequencesBackToTheOriginalNames` / `testLegacyAndCurrentArchivesRestoreSideBySide` | 新归档正确往返；新旧归档各自还原，文件名、内容、哈希一致 |
+| `testUploadSelfCheckAcceptsABackslashFileName` / `testBackslashFileNameSurvivesUploadAndDownload` | 上传自校验通过；上传 → 下载 → 解压后目录哈希不变 |
 | `testArchiveAboveTheGitHubLimitIsRejectedBeforeAnyRequest` | ≥ 100 MiB 在联网前拒绝 |
 | `testLegacySettingsAreMigratedWithoutLosingChoices` / `testLegacyGamesJSONKeepsEveryGame` / `testSyncKindDecodingIsTolerant` | 旧 `settings.json` / `games.json` 可读，历史保留份数迁移为本地保留份数 |
 | `testDefaultRepositoryIsNeverTheSourceRepository` / `testRepositoryValidation` | 不会默认指向源码仓库，字段校验 |
@@ -426,7 +436,7 @@ GitHub 相关的单元测试把生产代码（`GitHubAPIClient` + `GitHubStorage
 **已在模拟器与桌面上验证**
 
 - macOS 与 iOS 两端都能编译通过（Debug / Release）。
-- 118 个单元测试、11 个 UI 测试全部通过。
+- 137 个单元测试、11 个 UI 测试全部通过。
 - macOS App 可启动、可添加配置、可同步（用内置演示远端跑通整条链路）。
 - iOS 模拟器上：列表/详情/冲突弹窗/确认弹窗/真实同步执行（端到端 UI 测试）。
 

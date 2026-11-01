@@ -161,12 +161,25 @@ public struct ZipEntrySource: Sendable {
     }
 }
 
+/// Declares how an archive stored its entry names, so a reader never has to guess from the names.
+///
+/// The marker is the archive comment in the end-of-central-directory record. Archives written
+/// before escaping existed have no comment at all, which is what identifies them as version 1;
+/// a plain name such as `%5Cdata.bin` in such an archive is a real file name and must not be
+/// decoded.
+public enum ZipMarker {
+    /// Entry names were escaped with ``ArchivePath``: `\` → `%5C`, `%` → `%25`.
+    public static let escapedPaths = "GameSaveSync path encoding 2"
+}
+
 public enum ZipWriter {
     private static let localSignature: UInt32 = 0x04034b50
     private static let centralSignature: UInt32 = 0x02014b50
     private static let endSignature: UInt32 = 0x06054b50
 
-    public static func write(entries: [ZipEntrySource], to url: URL) throws {
+    /// `comment` is stored in the end-of-central-directory record. It is how an archive declares
+    /// which naming scheme its entry names use; see ``ZipMarker``.
+    public static func write(entries: [ZipEntrySource], to url: URL, comment: String? = nil) throws {
         guard entries.count <= 65535 else {
             throw ZipError.unsupportedZip64("more than 65535 entries")
         }
@@ -251,6 +264,11 @@ public enum ZipWriter {
         let centralOffset = offset
         try handle.write(contentsOf: central)
 
+        let commentData = Data((comment ?? "").utf8)
+        guard commentData.count <= 65535 else {
+            throw ZipError.writeFailed("archive comment too long")
+        }
+
         var end = Data()
         end.appendLE(endSignature)
         end.appendLE(UInt16(0))
@@ -259,7 +277,8 @@ public enum ZipWriter {
         end.appendLE(UInt16(entries.count))
         end.appendLE(UInt32(central.count))
         end.appendLE(centralOffset)
-        end.appendLE(UInt16(0))
+        end.appendLE(UInt16(commentData.count))
+        end.append(commentData)
         try handle.write(contentsOf: end)
     }
 }
@@ -284,8 +303,18 @@ public enum ZipReader {
     private static let endSignature: UInt32 = 0x06054b50
 
     public static func entries(at url: URL) throws -> [ZipEntryInfo] {
-        let data = try mapped(url)
-        return try parseCentralDirectory(data)
+        try parseDirectory(try mapped(url)).entries
+    }
+
+    /// Archive comment, used as the format marker (see ``ZipMarker``). `nil` for archives that do
+    /// not carry one, which is every archive written before the marker existed.
+    public static func comment(at url: URL) throws -> String? {
+        try parseDirectory(try mapped(url)).comment
+    }
+
+    private struct Directory {
+        let entries: [ZipEntryInfo]
+        let comment: String?
     }
 
     private static func mapped(_ url: URL) throws -> Data {
@@ -295,7 +324,7 @@ public enum ZipReader {
         return data
     }
 
-    private static func parseCentralDirectory(_ data: Data) throws -> [ZipEntryInfo] {
+    private static func parseDirectory(_ data: Data) throws -> Directory {
         guard data.count >= 22 else {
             throw ZipError.readFailed("archive is too small")
         }
@@ -303,7 +332,8 @@ public enum ZipReader {
         var eocd: Int?
         var index = data.count - 22
         while index >= searchLimit {
-            if data.readUInt32(at: index) == endSignature {
+            if data.readUInt32(at: index) == endSignature,
+               index + 22 + Int(data.readUInt16(at: index + 20)) <= data.count {
                 eocd = index
                 break
             }
@@ -316,6 +346,14 @@ public enum ZipReader {
         let entryCount = Int(data.readUInt16(at: eocd + 10))
         let centralSize = Int(data.readUInt32(at: eocd + 12))
         let centralOffset = Int(data.readUInt32(at: eocd + 16))
+        let archiveCommentLength = Int(data.readUInt16(at: eocd + 20))
+        let comment: String?
+        if archiveCommentLength > 0, eocd + 22 + archiveCommentLength <= data.count {
+            comment = String(data: data.subdata(in: (eocd + 22)..<(eocd + 22 + archiveCommentLength)),
+                             encoding: .utf8)
+        } else {
+            comment = nil
+        }
 
         if entryCount == 0xFFFF || centralOffset == 0xFFFF_FFFF || centralSize == 0xFFFF_FFFF {
             throw ZipError.unsupportedZip64("ZIP64 archives are not supported")
@@ -365,15 +403,21 @@ public enum ZipReader {
                                         unixPermissions: permissions))
             cursor += 46 + nameLength + extraLength + commentLength
         }
-        return entries
+        return Directory(entries: entries, comment: comment)
     }
 
     /// Extracts an archive into `destination`. Every entry name is validated, CRCs are checked,
     /// and nothing outside `destination` can ever be written.
+    ///
+    /// Names are un-escaped with ``ArchivePath`` only when the archive carries the
+    /// ``ZipMarker/escapedPaths`` marker. Archives written before that marker existed store raw
+    /// names, so a file that really is called `%5Cdata.bin` keeps its name.
     @discardableResult
     public static func extract(at url: URL, to destination: URL, maxTotalBytes: Int64 = 8 << 30) throws -> [String] {
         let data = try mapped(url)
-        let entries = try parseCentralDirectory(data)
+        let directory = try parseDirectory(data)
+        let entries = directory.entries
+        let escapesPaths = directory.comment == ZipMarker.escapedPaths
         let fm = FileManager.default
         try fm.createDirectory(at: destination, withIntermediateDirectories: true)
         let rootPath = FileSystem.canonicalPath(for: destination)
@@ -382,11 +426,15 @@ public enum ZipReader {
         var totalBytes: Int64 = 0
 
         for entry in entries {
-            let relative = try SafePath.relativePath(fromArchiveEntry: entry.path, isDirectory: entry.isDirectory)
-            if relative.isEmpty { continue }
+            let validated = try SafePath.relativePath(fromArchiveEntry: entry.path, isDirectory: entry.isDirectory)
+            if validated.isEmpty { continue }
             if entry.isSymlink {
                 throw ZipError.unsafePath("symbolic link entry: \(entry.path)")
             }
+            // A marker-bearing archive escapes its names (see `ArchivePath`), so validation runs on
+            // a name that can only use `/` as a separator and the decoded name is what the save
+            // folder really holds. A legacy archive stores names verbatim and is left alone.
+            let relative = escapesPaths ? ArchivePath.decode(validated) : validated
             let target = destination.appendingPathComponent(relative)
             let standardized = FileSystem.canonicalPath(for: target)
             guard standardized == rootPath || standardized.hasPrefix(rootPath + "/") else {
@@ -447,6 +495,11 @@ public enum ZipReader {
 
 public enum SafePath {
     /// Turns an archive entry name into a relative path that cannot escape its destination.
+    ///
+    /// Entry names are never allowed to carry a raw backslash: on Windows it is a separator and
+    /// `..\..\x` is a traversal. Save folders can legitimately contain a file called
+    /// `\savedata0.bin`, so such names are escaped by `ArchivePath` before they are stored and
+    /// decoded again after this check has passed.
     public static func relativePath(fromArchiveEntry raw: String, isDirectory: Bool) throws -> String {
         guard !raw.isEmpty, !raw.contains("\0") else {
             throw ZipError.unsafePath(raw)
@@ -478,6 +531,78 @@ public enum SafePath {
         guard !cleaned.isEmpty else { throw ZipError.unsafePath(raw) }
         _ = isDirectory
         return cleaned.joined(separator: "/")
+    }
+}
+
+/// Maps a save folder path to a ZIP entry name and back.
+///
+/// A backslash is a perfectly legal character in an APFS file name, and games that were written
+/// for Windows really do create files such as `\savedata0.bin`. Storing that name verbatim would
+/// make the archive ambiguous — some extractors read `\` as a directory separator — and would be
+/// rejected by ``SafePath``, which treats any raw backslash in an entry name as hostile.
+///
+/// So both characters that could be misread are percent-escaped per path component:
+///
+/// | character | stored as |
+/// | --- | --- |
+/// | `\` | `%5C` |
+/// | `%` | `%25` |
+///
+/// The mapping is reversible: every `%` is escaped, so a name that already contains `%5C` survives
+/// a round trip unchanged. Components without either character are stored verbatim, which keeps
+/// ordinary archives byte-identical to what earlier versions produced. Decoding only recognises
+/// the two escapes above, so a plain name such as `100%done.sav` is left alone.
+public enum ArchivePath {
+    public static func encode(_ relativePath: String) -> String {
+        relativePath
+            .split(separator: "/", omittingEmptySubsequences: false)
+            .map(encodeComponent)
+            .joined(separator: "/")
+    }
+
+    public static func decode(_ entryName: String) -> String {
+        guard entryName.contains("%") else { return entryName }
+        return entryName
+            .split(separator: "/", omittingEmptySubsequences: false)
+            .map(decodeComponent)
+            .joined(separator: "/")
+    }
+
+    private static func encodeComponent(_ component: Substring) -> String {
+        guard component.contains("\\") || component.contains("%") else { return String(component) }
+        var encoded = ""
+        encoded.reserveCapacity(component.count)
+        for character in component {
+            switch character {
+            case "\\": encoded += "%5C"
+            case "%": encoded += "%25"
+            default: encoded.append(character)
+            }
+        }
+        return encoded
+    }
+
+    private static func decodeComponent(_ component: Substring) -> String {
+        guard component.contains("%") else { return String(component) }
+        var decoded = ""
+        var rest = component[...]
+        while let percent = rest.firstIndex(of: "%") {
+            decoded.append(contentsOf: rest[rest.startIndex..<percent])
+            let escape = rest[percent...]
+            if escape.hasPrefix("%25") {
+                decoded.append("%")
+                rest = escape.dropFirst(3)
+            } else if escape.hasPrefix("%5C") {
+                decoded.append("\\")
+                rest = escape.dropFirst(3)
+            } else {
+                // Not an escape this codec writes: keep the character as part of the file name.
+                decoded.append("%")
+                rest = escape.dropFirst()
+            }
+        }
+        decoded.append(contentsOf: rest)
+        return decoded
     }
 }
 

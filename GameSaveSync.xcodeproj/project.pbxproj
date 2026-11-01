@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		0209228CE2527EBE5236F641 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3370CFF0CAA13E315212047E /* RootView.swift */; };
 		03FDDC3671B64701A9527ADD /* Zip.swift in Sources */ = {isa = PBXBuildFile; fileRef = E490899D148F3CF255473249 /* Zip.swift */; };
+		0B23A39177EEC83F58A81468 /* ArchivePathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17F411A15AB25318F7A8B642 /* ArchivePathTests.swift */; };
 		0BBDCA4E0E63306EE83211C4 /* BackupManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDC972E7831327F416559589 /* BackupManager.swift */; };
 		1250D8B7157A582417F0C1B0 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBCACF2BBC9D7FA9CF47925D /* SettingsView.swift */; };
 		146B54D3A72CD5E637BA4C09 /* BackupManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDC972E7831327F416559589 /* BackupManager.swift */; };
@@ -111,6 +112,7 @@
 		0266E7711435E554B66456D2 /* LocalAccessTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalAccessTests.swift; sourceTree = "<group>"; };
 		0B38EDF365E655C10AEBB7B6 /* SyncFolderBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncFolderBrowserView.swift; sourceTree = "<group>"; };
 		104242C27D8CA1C04B7200D1 /* Game.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Game.swift; sourceTree = "<group>"; };
+		17F411A15AB25318F7A8B642 /* ArchivePathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArchivePathTests.swift; sourceTree = "<group>"; };
 		18C89A110B89C571F89C96F0 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
 		19E65AF96CE3AF013834DFE9 /* SyncEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncEngine.swift; sourceTree = "<group>"; };
 		29F595F64B94ED583B089F8B /* LocalizationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizationTests.swift; sourceTree = "<group>"; };
@@ -205,6 +207,7 @@
 		2D49556501E2159CCDFD9923 /* GameSaveSyncTests */ = {
 			isa = PBXGroup;
 			children = (
+				17F411A15AB25318F7A8B642 /* ArchivePathTests.swift */,
 				716B74AED7132CF529228F47 /* GitHubTests.swift */,
 				0266E7711435E554B66456D2 /* LocalAccessTests.swift */,
 				29F595F64B94ED583B089F8B /* LocalizationTests.swift */,
@@ -557,6 +560,7 @@
 			files = (
 				A9A994963CFDBCF1A44944F0 /* AppPaths.swift in Sources */,
 				93D2F1568333DA7F6EDE1697 /* ArchiveManager.swift in Sources */,
+				0B23A39177EEC83F58A81468 /* ArchivePathTests.swift in Sources */,
 				EDD6C352B237C4BA5C445DBA /* BackupManager.swift in Sources */,
 				668D8751E8C68C172CC140EB /* ConfigurationStore.swift in Sources */,
 				3219A5BE510067841A51E7DD /* DirectoryReplacer.swift in Sources */,

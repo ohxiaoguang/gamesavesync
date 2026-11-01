@@ -487,6 +487,53 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertTrue(FileSystem.isDirectory(deviceB.appendingPathComponent("空目录")),
                       "empty directories must survive a round trip")
     }
+
+    // MARK: - File names with a backslash
+
+    func testUploadSelfCheckAcceptsABackslashFileName() async throws {
+        let stamp = TestSupport.date("2026-11-01T09:00:00.000Z")
+        try TestSupport.write(deviceA, "\\savedata0.bin", "slot zero", modified: stamp)
+        try TestSupport.write(deviceA, "profile\\options.ini", "opts", modified: stamp.addingTimeInterval(-60))
+
+        let local = try SaveScanner().scan(directory: deviceA, computeHash: true).snapshot
+
+        let report = try await engine.upload(request(deviceA, hasSyncedBefore: false))
+
+        XCTAssertEqual(report.outcome, .uploaded)
+        XCTAssertEqual(report.files, 2)
+        XCTAssertEqual(harness.manifest(gameId: gameId)?.contentHash, local.contentHash,
+                       "the archive that was uploaded must match the folder that was scanned")
+
+        let archive = try XCTUnwrap(harness.archiveData(gameId: gameId))
+        let url = root.appendingPathComponent("remote.zip")
+        try archive.write(to: url)
+        let names = try ZipReader.entries(at: url).map(\.path)
+        XCTAssertTrue(names.contains("%5Csavedata0.bin"), "entry names stay free of backslashes: \(names)")
+    }
+
+    func testBackslashFileNameSurvivesUploadAndDownload() async throws {
+        let stamp = TestSupport.date("2026-10-31T20:30:00.000Z")
+        try TestSupport.write(deviceA, "\\savedata0.bin", "slot zero", modified: stamp)
+        try TestSupport.write(deviceA, "bin\\x/slot1.sav", "nested", modified: stamp.addingTimeInterval(-120))
+        try TestSupport.write(deviceA, "100% done.sav", "percent", modified: stamp.addingTimeInterval(-240))
+
+        let before = try SaveScanner().scan(directory: deviceA, computeHash: true)
+
+        _ = try await engine.upload(request(deviceA))
+        _ = try await engine.restore(request(deviceB))
+
+        XCTAssertEqual(TestSupport.relativeFileList(deviceB), before.files.map(\.relativePath).sorted(),
+                       "the restored folder must have exactly the original names")
+        let after = try SaveScanner().scan(directory: deviceB, computeHash: true)
+        XCTAssertEqual(after.snapshot.contentHash, before.snapshot.contentHash,
+                       "restored content must hash identically to the uploaded folder")
+        for file in before.files {
+            XCTAssertEqual(try Hashing.sha256Hex(fileAt: deviceB.appendingPathComponent(file.relativePath)),
+                           try Hashing.sha256Hex(fileAt: file.url))
+        }
+        let restored = TestSupport.modificationDate(deviceB, "\\savedata0.bin")
+        XCTAssertEqual(restored?.timeIntervalSince1970 ?? 0, stamp.timeIntervalSince1970, accuracy: 0.05)
+    }
 }
 
 final class DirectoryReplacerTests: XCTestCase {
