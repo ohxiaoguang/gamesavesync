@@ -1,0 +1,103 @@
+name: GameSaveSync
+
+options:
+  bundleIdPrefix: com.gamesavesync
+  deploymentTarget:
+    iOS: "17.0"
+    macOS: "14.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  developmentLanguage: en
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    ALWAYS_SEARCH_USER_PATHS: NO
+    CLANG_ENABLE_MODULES: YES
+    GCC_NO_COMMON_BLOCKS: YES
+
+targets:
+  GameSaveSync-macOS:
+    type: application
+    platform: macOS
+    sources:
+      - path: GameSaveSync/Shared
+      - path: GameSaveSync/macOS
+      - path: GameSaveSync/Resources
+    settings:
+      base:
+        PRODUCT_NAME: GameSaveSync
+        PRODUCT_BUNDLE_IDENTIFIER: com.gamesavesync.app
+        INFOPLIST_FILE: GameSaveSync/macOS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: GameSaveSync/macOS/GameSaveSync.entitlements
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        COMBINE_HIDPI_IMAGES: YES
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        ENABLE_HARDENED_RUNTIME: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    scheme:
+      testTargets:
+        - GameSaveSyncTests
+
+  GameSaveSync-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: GameSaveSync/Shared
+      - path: GameSaveSync/iOS
+      - path: GameSaveSync/Resources
+    settings:
+      base:
+        PRODUCT_NAME: GameSaveSync
+        PRODUCT_BUNDLE_IDENTIFIER: com.gamesavesync.app
+        INFOPLIST_FILE: GameSaveSync/iOS/Info.plist
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: ""
+    scheme:
+      testTargets:
+        - GameSaveSyncUITests
+
+  GameSaveSyncUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: GameSaveSyncUITests
+    dependencies:
+      - target: GameSaveSync-iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gamesavesync.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: GameSaveSync-iOS
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+
+  GameSaveSyncTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: GameSaveSyncTests
+      - path: GameSaveSync/Shared/Models
+      - path: GameSaveSync/Shared/Services
+      - path: GameSaveSync/Shared/Sync
+      - path: GameSaveSync/Shared/Support
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gamesavesync.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+        MACOSX_DEPLOYMENT_TARGET: "14.0"

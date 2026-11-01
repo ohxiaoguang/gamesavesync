@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+._*
+
+# Xcode / 构建产物
+build/
+dist/
+DerivedData/
+.build/
+*.ipa
+*.app
+*.xcarchive
+*.dSYM
+*.xcuserstate
+xcuserdata/
+
+# SwiftPM
+.build/
+Package.resolved
+
+# 日志与临时文件
+*.log
+*.swp
+*~
+.DS_Store?
+
+# 本地存档 / iCloud 同步测试数据
+*.save
+Backups/
+TestResults/
+*.xcresult
+
+# 证书与敏感配置
+*.p12
+*.pem
+*.key
+*.mobileprovision
+*.cer
+provisioning/
+secrets*
+Credentials*
+.googlecookies
